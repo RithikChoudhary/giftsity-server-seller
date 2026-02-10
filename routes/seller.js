@@ -7,7 +7,7 @@ const SellerPayout = require('../../server/models/SellerPayout');
 const PlatformSettings = require('../../server/models/PlatformSettings');
 const Shipment = require('../../server/models/Shipment');
 const { requireAuth, requireSeller } = require('../../server/middleware/auth');
-const { uploadImage, deleteImage } = require('../../server/config/cloudinary');
+const { uploadImage, uploadVideo, deleteImage, deleteVideo, deleteMedia } = require('../../server/config/cloudinary');
 const { slugify } = require('../../server/utils/slugify');
 const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
@@ -87,31 +87,58 @@ router.get('/products', async (req, res) => {
   }
 });
 
-router.post('/products', upload.array('images', 10), async (req, res) => {
+router.post('/products', upload.array('media', 15), async (req, res) => {
   try {
-    const data = { ...req.body, sellerId: req.user._id };
+    const sellerId = req.user._id;
+    const data = { ...req.body, sellerId };
     data.slug = slugify(data.title);
 
-    // Handle uploaded files (convert buffer to base64 for Cloudinary)
-    const uploaded = [];
+    const sellerFolder = `giftsity/products/${sellerId}`;
+    const uploadedImages = [];
+    const uploadedMedia = [];
+
+    // Handle uploaded files (images + videos via multipart)
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-        const result = await uploadImage(base64, { folder: 'giftsity/products' });
-        uploaded.push(result);
+        const isVideo = file.mimetype.startsWith('video/');
+
+        if (isVideo) {
+          const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        } else {
+          const result = await uploadImage(base64, { folder: sellerFolder });
+          uploadedImages.push(result);
+          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId, width: result.width || 0, height: result.height || 0 });
+        }
       }
     }
+
     // Also handle base64 strings sent in body (backward compat)
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
-          const result = await uploadImage(img, { folder: 'giftsity/products' });
-          uploaded.push(result);
+          const result = await uploadImage(img, { folder: sellerFolder });
+          uploadedImages.push(result);
+          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
       }
       delete data.newImages;
     }
-    if (uploaded.length > 0) data.images = uploaded;
+
+    // Handle base64 video strings in body
+    if (data.newVideos && Array.isArray(data.newVideos)) {
+      for (const vid of data.newVideos) {
+        if (typeof vid === 'string' && vid.startsWith('data:')) {
+          const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        }
+      }
+      delete data.newVideos;
+    }
+
+    if (uploadedImages.length > 0) data.images = uploadedImages;
+    if (uploadedMedia.length > 0) data.media = uploadedMedia;
 
     // Parse numeric fields from FormData strings
     if (data.price) data.price = Number(data.price);
@@ -134,12 +161,14 @@ router.post('/products', upload.array('images', 10), async (req, res) => {
   }
 });
 
-router.put('/products/:id', upload.array('images', 10), async (req, res) => {
+router.put('/products/:id', upload.array('media', 15), async (req, res) => {
   try {
-    const product = await Product.findOne({ _id: req.params.id, sellerId: req.user._id });
+    const sellerId = req.user._id;
+    const product = await Product.findOne({ _id: req.params.id, sellerId });
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
     const data = { ...req.body, updatedAt: Date.now() };
+    const sellerFolder = `giftsity/products/${sellerId}`;
 
     // Parse existing images from JSON string (sent via FormData)
     let existingImages = [];
@@ -148,31 +177,64 @@ router.put('/products/:id', upload.array('images', 10), async (req, res) => {
       delete data.existingImages;
     }
 
-    // Handle uploaded files (convert buffer to base64 for Cloudinary)
-    const uploaded = [];
+    // Parse existing media from JSON string
+    let existingMedia = [];
+    if (data.existingMedia) {
+      try { existingMedia = JSON.parse(data.existingMedia); } catch { existingMedia = []; }
+      delete data.existingMedia;
+    }
+
+    // Handle uploaded files (images + videos via multipart)
+    const uploadedImages = [];
+    const uploadedMedia = [];
     if (req.files && req.files.length > 0) {
       for (const file of req.files) {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-        const result = await uploadImage(base64, { folder: 'giftsity/products' });
-        uploaded.push(result);
+        const isVideo = file.mimetype.startsWith('video/');
+
+        if (isVideo) {
+          const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        } else {
+          const result = await uploadImage(base64, { folder: sellerFolder });
+          uploadedImages.push(result);
+          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
+        }
       }
     }
-    // Also handle base64 strings in body (backward compat)
+
+    // Also handle base64 image strings in body (backward compat)
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
-          const result = await uploadImage(img, { folder: 'giftsity/products' });
-          uploaded.push(result);
+          const result = await uploadImage(img, { folder: sellerFolder });
+          uploadedImages.push(result);
+          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
       }
       delete data.newImages;
     }
 
-    if (uploaded.length > 0 || existingImages.length > 0) {
-      data.images = [...existingImages, ...uploaded];
+    // Handle base64 video strings in body
+    if (data.newVideos && Array.isArray(data.newVideos)) {
+      for (const vid of data.newVideos) {
+        if (typeof vid === 'string' && vid.startsWith('data:')) {
+          const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        }
+      }
+      delete data.newVideos;
     }
 
-    // Handle deleted images
+    // Merge existing + newly uploaded
+    if (uploadedImages.length > 0 || existingImages.length > 0) {
+      data.images = [...existingImages, ...uploadedImages];
+    }
+    if (uploadedMedia.length > 0 || existingMedia.length > 0) {
+      data.media = [...existingMedia, ...uploadedMedia];
+    }
+
+    // Handle deleted images (cleanup from Cloudinary)
     if (data.deletedImageIds) {
       let ids = data.deletedImageIds;
       if (typeof ids === 'string') { try { ids = JSON.parse(ids); } catch { ids = []; } }
@@ -180,6 +242,23 @@ router.put('/products/:id', upload.array('images', 10), async (req, res) => {
         for (const publicId of ids) { await deleteImage(publicId); }
       }
       delete data.deletedImageIds;
+    }
+
+    // Handle deleted media (images + videos cleanup from Cloudinary)
+    if (data.deletedMediaIds) {
+      let mediaIds = data.deletedMediaIds;
+      if (typeof mediaIds === 'string') { try { mediaIds = JSON.parse(mediaIds); } catch { mediaIds = []; } }
+      if (Array.isArray(mediaIds)) {
+        for (const item of mediaIds) {
+          // item can be { publicId, type } or just a publicId string
+          if (typeof item === 'object' && item.publicId) {
+            await deleteMedia(item.publicId, item.type || 'image');
+          } else if (typeof item === 'string') {
+            await deleteImage(item);
+          }
+        }
+      }
+      delete data.deletedMediaIds;
     }
 
     // Parse numeric fields from FormData strings
@@ -210,13 +289,22 @@ router.delete('/products/:id', async (req, res) => {
     const product = await Product.findOne({ _id: req.params.id, sellerId: req.user._id });
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
-    for (const img of product.images) {
+    // Clean up all images from Cloudinary
+    for (const img of product.images || []) {
       if (img.publicId) await deleteImage(img.publicId);
+    }
+
+    // Clean up all media (images + videos) from Cloudinary
+    for (const m of product.media || []) {
+      if (m.publicId) {
+        await deleteMedia(m.publicId, m.type || 'image');
+      }
     }
 
     await Product.findByIdAndDelete(req.params.id);
     res.json({ message: 'Product deleted' });
   } catch (err) {
+    console.error('Delete product error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });
