@@ -15,13 +15,29 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 // Routes - all mounted under /api/seller
 app.use('/api/seller', require('./routes/seller'));
 
 // Health check
 app.get('/api/seller/health', (req, res) => res.json({ status: 'ok', service: 'giftsity-seller', port: PORT }));
+
+// 404 handler for undefined routes
+app.use((req, res) => {
+  res.status(404).json({ message: `Route ${req.method} ${req.originalUrl} not found` });
+});
+
+// Global error handler
+app.use((err, req, res, _next) => {
+  console.error('[Seller Server Error]', err.message);
+  res.status(err.status || 500).json({ message: err.message || 'Internal server error' });
+});
+
+// Graceful error handling
+process.on('unhandledRejection', (err) => {
+  console.error('[Unhandled Rejection]', err);
+});
 
 // Start
 connectDB().then(() => {

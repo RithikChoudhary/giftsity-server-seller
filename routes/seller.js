@@ -12,7 +12,7 @@ const { slugify } = require('../../server/utils/slugify');
 const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
 
 router.use(requireAuth, requireSeller);
 
@@ -88,6 +88,7 @@ router.get('/products', async (req, res) => {
 });
 
 router.post('/products', upload.array('media', 15), async (req, res) => {
+  const allUploadedPublicIds = []; // Track for cleanup on failure
   try {
     const sellerId = req.user._id;
     const data = { ...req.body, sellerId };
@@ -105,9 +106,11 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
 
         if (isVideo) {
           const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+          allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         } else {
           const result = await uploadImage(base64, { folder: sellerFolder });
+          allUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId, width: result.width || 0, height: result.height || 0 });
         }
@@ -119,6 +122,7 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
           const result = await uploadImage(img, { folder: sellerFolder });
+          allUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
@@ -131,6 +135,7 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
+          allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         }
       }
@@ -156,12 +161,17 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
     await product.save();
     res.status(201).json({ product, message: 'Product created' });
   } catch (err) {
+    // Cleanup orphaned uploads if product save failed
+    for (const item of allUploadedPublicIds) {
+      await deleteMedia(item.publicId, item.type).catch(() => {});
+    }
     console.error('Create product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
 router.put('/products/:id', upload.array('media', 15), async (req, res) => {
+  const newUploadedPublicIds = []; // Track new uploads for cleanup on failure
   try {
     const sellerId = req.user._id;
     const product = await Product.findOne({ _id: req.params.id, sellerId });
@@ -194,9 +204,11 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
 
         if (isVideo) {
           const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         } else {
           const result = await uploadImage(base64, { folder: sellerFolder });
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
@@ -208,6 +220,7 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
           const result = await uploadImage(img, { folder: sellerFolder });
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
@@ -220,6 +233,7 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         }
       }
@@ -250,11 +264,12 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
       if (typeof mediaIds === 'string') { try { mediaIds = JSON.parse(mediaIds); } catch { mediaIds = []; } }
       if (Array.isArray(mediaIds)) {
         for (const item of mediaIds) {
-          // item can be { publicId, type } or just a publicId string
           if (typeof item === 'object' && item.publicId) {
             await deleteMedia(item.publicId, item.type || 'image');
           } else if (typeof item === 'string') {
-            await deleteImage(item);
+            // Look up type from product's existing media to delete correctly
+            const mediaEntry = product.media?.find(m => m.publicId === item);
+            await deleteMedia(item, mediaEntry?.type || 'image');
           }
         }
       }
@@ -279,6 +294,10 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
     await product.save();
     res.json({ product, message: 'Product updated' });
   } catch (err) {
+    // Cleanup newly uploaded files if save failed
+    for (const item of newUploadedPublicIds) {
+      await deleteMedia(item.publicId, item.type).catch(() => {});
+    }
     console.error('Update product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
