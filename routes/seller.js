@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const Product = require('../../server/models/Product');
 const Order = require('../../server/models/Order');
 const User = require('../../server/models/User');
@@ -11,6 +12,7 @@ const { slugify } = require('../../server/utils/slugify');
 const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 router.use(requireAuth, requireSeller);
 
@@ -85,62 +87,120 @@ router.get('/products', async (req, res) => {
   }
 });
 
-router.post('/products', async (req, res) => {
+router.post('/products', upload.array('images', 10), async (req, res) => {
   try {
     const data = { ...req.body, sellerId: req.user._id };
     data.slug = slugify(data.title);
 
+    // Handle uploaded files (convert buffer to base64 for Cloudinary)
+    const uploaded = [];
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+        const result = await uploadImage(base64, { folder: 'giftsity/products' });
+        uploaded.push(result);
+      }
+    }
+    // Also handle base64 strings sent in body (backward compat)
     if (data.newImages && Array.isArray(data.newImages)) {
-      const uploaded = [];
       for (const img of data.newImages) {
-        if (img.startsWith('data:')) {
+        if (typeof img === 'string' && img.startsWith('data:')) {
           const result = await uploadImage(img, { folder: 'giftsity/products' });
           uploaded.push(result);
         }
       }
-      data.images = uploaded;
       delete data.newImages;
     }
+    if (uploaded.length > 0) data.images = uploaded;
+
+    // Parse numeric fields from FormData strings
+    if (data.price) data.price = Number(data.price);
+    if (data.stock) data.stock = Number(data.stock);
+    if (data.weight) data.weight = Number(data.weight);
+
+    // Parse customization fields from FormData
+    data.isCustomizable = data.isCustomizable === 'true' || data.isCustomizable === true;
+    if (data.customizationOptions && typeof data.customizationOptions === 'string') {
+      try { data.customizationOptions = JSON.parse(data.customizationOptions); } catch (e) { data.customizationOptions = []; }
+    }
+    if (!data.isCustomizable) data.customizationOptions = [];
 
     const product = new Product(data);
     await product.save();
     res.status(201).json({ product, message: 'Product created' });
   } catch (err) {
+    console.error('Create product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
-router.put('/products/:id', async (req, res) => {
+router.put('/products/:id', upload.array('images', 10), async (req, res) => {
   try {
     const product = await Product.findOne({ _id: req.params.id, sellerId: req.user._id });
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
     const data = { ...req.body, updatedAt: Date.now() };
 
+    // Parse existing images from JSON string (sent via FormData)
+    let existingImages = [];
+    if (data.existingImages) {
+      try { existingImages = JSON.parse(data.existingImages); } catch { existingImages = []; }
+      delete data.existingImages;
+    }
+
+    // Handle uploaded files (convert buffer to base64 for Cloudinary)
+    const uploaded = [];
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+        const result = await uploadImage(base64, { folder: 'giftsity/products' });
+        uploaded.push(result);
+      }
+    }
+    // Also handle base64 strings in body (backward compat)
     if (data.newImages && Array.isArray(data.newImages)) {
-      const uploaded = [];
       for (const img of data.newImages) {
-        if (img.startsWith('data:')) {
+        if (typeof img === 'string' && img.startsWith('data:')) {
           const result = await uploadImage(img, { folder: 'giftsity/products' });
           uploaded.push(result);
         }
       }
-      data.images = [...(data.existingImages || []), ...uploaded];
       delete data.newImages;
-      delete data.existingImages;
     }
 
-    if (data.deletedImageIds && Array.isArray(data.deletedImageIds)) {
-      for (const publicId of data.deletedImageIds) {
-        await deleteImage(publicId);
+    if (uploaded.length > 0 || existingImages.length > 0) {
+      data.images = [...existingImages, ...uploaded];
+    }
+
+    // Handle deleted images
+    if (data.deletedImageIds) {
+      let ids = data.deletedImageIds;
+      if (typeof ids === 'string') { try { ids = JSON.parse(ids); } catch { ids = []; } }
+      if (Array.isArray(ids)) {
+        for (const publicId of ids) { await deleteImage(publicId); }
       }
       delete data.deletedImageIds;
     }
+
+    // Parse numeric fields from FormData strings
+    if (data.price) data.price = Number(data.price);
+    if (data.stock) data.stock = Number(data.stock);
+    if (data.weight) data.weight = Number(data.weight);
+
+    // Parse customization fields from FormData
+    if (data.isCustomizable !== undefined) {
+      data.isCustomizable = data.isCustomizable === 'true' || data.isCustomizable === true;
+    }
+    if (data.customizationOptions && typeof data.customizationOptions === 'string') {
+      try { data.customizationOptions = JSON.parse(data.customizationOptions); } catch (e) { data.customizationOptions = []; }
+    }
+    if (data.isCustomizable === false) data.customizationOptions = [];
 
     Object.assign(product, data);
     await product.save();
     res.json({ product, message: 'Product updated' });
   } catch (err) {
+    console.error('Update product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
@@ -178,6 +238,33 @@ router.get('/orders', async (req, res) => {
   }
 });
 
+router.put('/orders/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const order = await Order.findOne({ _id: req.params.id, sellerId: req.user._id });
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+
+    const transitions = { pending: ['confirmed', 'cancelled'], confirmed: ['shipped', 'cancelled'], shipped: ['delivered'], processing: ['shipped', 'cancelled'] };
+    const allowed = transitions[order.status] || [];
+    if (!allowed.includes(status)) return res.status(400).json({ message: `Cannot change from ${order.status} to ${status}` });
+
+    order.status = status;
+    if (status === 'cancelled') order.cancelledAt = new Date();
+    if (status === 'delivered') {
+      order.deliveredAt = new Date();
+      // Send delivered email
+      try {
+        const { sendDeliveredEmail } = require('../../server/utils/email');
+        if (order.customerEmail) await sendDeliveredEmail(order.customerEmail, order);
+      } catch (e) { console.error('Delivered email error:', e.message); }
+    }
+    await order.save();
+    res.json({ order, message: `Order ${status}` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 router.put('/orders/:id/ship', async (req, res) => {
   try {
     const { courierName, trackingNumber, estimatedDelivery } = req.body;
@@ -192,6 +279,13 @@ router.put('/orders/:id/ship', async (req, res) => {
       estimatedDelivery: estimatedDelivery ? new Date(estimatedDelivery) : null
     };
     await order.save();
+
+    // Send shipped email
+    try {
+      const { sendShippedEmail } = require('../../server/utils/email');
+      if (order.customerEmail) await sendShippedEmail(order.customerEmail, order);
+    } catch (e) { console.error('Shipped email error:', e.message); }
+
     res.json({ order, message: 'Order marked as shipped' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -264,23 +358,29 @@ router.get('/marketing', async (req, res) => {
 // =================== SHIPPING (Shiprocket) ===================
 router.post('/shipping/serviceability', async (req, res) => {
   try {
+    console.log('[Shipping] Serviceability check started, orderId:', req.body.orderId);
     const { orderId } = req.body;
     const order = await Order.findById(orderId);
-    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (!order) { console.log('[Shipping] Order not found'); return res.status(404).json({ message: 'Order not found' }); }
     if (order.sellerId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not your order' });
+      console.log('[Shipping] Not seller\'s order'); return res.status(403).json({ message: 'Not your order' });
     }
 
     const seller = await User.findById(req.user._id);
-    const pickupPincode = seller.sellerProfile.pickupAddress?.pincode || seller.sellerProfile.businessAddress?.pincode;
-    if (!pickupPincode) return res.status(400).json({ message: 'Set your pickup address pincode first' });
+    const pickupPincode = seller.sellerProfile?.pickupAddress?.pincode || seller.sellerProfile?.businessAddress?.pincode;
+    console.log('[Shipping] Pickup pincode:', pickupPincode, ', Seller profile:', JSON.stringify(seller.sellerProfile?.pickupAddress || seller.sellerProfile?.businessAddress || 'NONE'));
+    if (!pickupPincode) return res.status(400).json({ message: 'Set your pickup address pincode in Seller Settings first' });
 
     const deliveryPincode = order.shippingAddress?.pincode;
+    console.log('[Shipping] Delivery pincode:', deliveryPincode);
     if (!deliveryPincode) return res.status(400).json({ message: 'Order has no delivery pincode' });
 
     const result = await shiprocket.checkServiceability({ pickupPincode, deliveryPincode, weight: 500, cod: 0 });
+    console.log('[Shipping] Shiprocket response keys:', Object.keys(result || {}));
+    console.log('[Shipping] Available couriers count:', result?.data?.available_courier_companies?.length || result?.available_courier_companies?.length || 0);
 
-    const couriers = (result.data?.available_courier_companies || []).map(c => ({
+    const companies = result?.data?.available_courier_companies || result?.available_courier_companies || [];
+    const couriers = companies.map(c => ({
       courierId: c.courier_company_id,
       courierName: c.courier_name,
       rate: c.rate,
@@ -289,6 +389,7 @@ router.post('/shipping/serviceability', async (req, res) => {
       rating: c.rating
     }));
 
+    console.log('[Shipping] Returning', couriers.length, 'couriers');
     res.json({ couriers, pickupPincode, deliveryPincode });
   } catch (err) {
     console.error('Serviceability error:', err?.response?.data || err.message);
@@ -332,7 +433,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
       })),
       payment_method: 'Prepaid',
       sub_total: order.totalAmount,
-      length, width, height,
+      length, breadth: width, height,
       weight: weight / 1000
     };
 
