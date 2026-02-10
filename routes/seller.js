@@ -308,14 +308,17 @@ router.delete('/products/:id', async (req, res) => {
     const product = await Product.findOne({ _id: req.params.id, sellerId: req.user._id });
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
-    // Clean up all images from Cloudinary
+    // Clean up all Cloudinary assets (deduplicated to avoid double-deletion)
+    const deletedIds = new Set();
     for (const img of product.images || []) {
-      if (img.publicId) await deleteImage(img.publicId);
+      if (img.publicId && !deletedIds.has(img.publicId)) {
+        deletedIds.add(img.publicId);
+        await deleteImage(img.publicId);
+      }
     }
-
-    // Clean up all media (images + videos) from Cloudinary
     for (const m of product.media || []) {
-      if (m.publicId) {
+      if (m.publicId && !deletedIds.has(m.publicId)) {
+        deletedIds.add(m.publicId);
         await deleteMedia(m.publicId, m.type || 'image');
       }
     }
