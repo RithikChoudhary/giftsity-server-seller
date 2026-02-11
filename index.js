@@ -4,7 +4,7 @@ const cors = require('cors');
 const connectDB = require('../server/config/db');
 
 const app = express();
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.SELLER_PORT || 5001;
 
 // Middleware - CORS supports comma-separated origins in CLIENT_URL
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map(s => s.trim());

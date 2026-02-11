@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const Product = require('../../server/models/Product');
 const Order = require('../../server/models/Order');
-const User = require('../../server/models/User');
+const Seller = require('../../server/models/Seller');
 const SellerPayout = require('../../server/models/SellerPayout');
 const PlatformSettings = require('../../server/models/PlatformSettings');
 const Shipment = require('../../server/models/Shipment');
@@ -11,6 +11,8 @@ const { uploadImage, uploadVideo, deleteImage, deleteVideo, deleteMedia } = requ
 const { slugify } = require('../../server/utils/slugify');
 const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
+const { sanitizeBody } = require('../../server/middleware/sanitize');
+const { logActivity } = require('../../server/utils/audit');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
 
@@ -43,7 +45,7 @@ router.get('/dashboard', async (req, res) => {
     const recentOrders = await Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items');
 
     // Get fresh user data for metrics
-    const freshUser = await User.findById(sellerId);
+    const freshUser = await Seller.findById(sellerId);
     const metrics = freshUser?.sellerProfile?.metrics || {};
 
     res.json({
@@ -87,7 +89,7 @@ router.get('/products', async (req, res) => {
   }
 });
 
-router.post('/products', upload.array('media', 15), async (req, res) => {
+router.post('/products', upload.array('media', 15), sanitizeBody, async (req, res) => {
   const allUploadedPublicIds = []; // Track for cleanup on failure
   try {
     const sellerId = req.user._id;
@@ -159,6 +161,7 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
 
     const product = new Product(data);
     await product.save();
+    logActivity({ domain: 'seller', action: 'product_created', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" created` });
     res.status(201).json({ product, message: 'Product created' });
   } catch (err) {
     // Cleanup orphaned uploads if product save failed
@@ -170,7 +173,7 @@ router.post('/products', upload.array('media', 15), async (req, res) => {
   }
 });
 
-router.put('/products/:id', upload.array('media', 15), async (req, res) => {
+router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req, res) => {
   const newUploadedPublicIds = []; // Track new uploads for cleanup on failure
   try {
     const sellerId = req.user._id;
@@ -292,6 +295,7 @@ router.put('/products/:id', upload.array('media', 15), async (req, res) => {
 
     Object.assign(product, data);
     await product.save();
+    logActivity({ domain: 'seller', action: 'product_updated', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" updated` });
     res.json({ product, message: 'Product updated' });
   } catch (err) {
     // Cleanup newly uploaded files if save failed
@@ -324,6 +328,7 @@ router.delete('/products/:id', async (req, res) => {
     }
 
     await Product.findByIdAndDelete(req.params.id);
+    logActivity({ domain: 'seller', action: 'product_deleted', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: req.params.id, message: `Product deleted` });
     res.json({ message: 'Product deleted' });
   } catch (err) {
     console.error('Delete product error:', err.message);
@@ -369,6 +374,7 @@ router.put('/orders/:id/status', async (req, res) => {
       } catch (e) { console.error('Delivered email error:', e.message); }
     }
     await order.save();
+    logActivity({ domain: 'seller', action: `order_${status}`, actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} marked as ${status}` });
     res.json({ order, message: `Order ${status}` });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -396,6 +402,7 @@ router.put('/orders/:id/ship', async (req, res) => {
       if (order.customerEmail) await sendShippedEmail(order.customerEmail, order);
     } catch (e) { console.error('Shipped email error:', e.message); }
 
+    logActivity({ domain: 'seller', action: 'order_shipped', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} shipped via ${courierName || 'unknown'}`, metadata: { courierName, trackingNumber } });
     res.json({ order, message: 'Order marked as shipped' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -415,7 +422,7 @@ router.get('/payouts', async (req, res) => {
 // =================== SETTINGS ===================
 router.get('/settings', async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
+    const user = await Seller.findById(req.user._id);
     res.json({
       sellerProfile: user.sellerProfile,
       name: user.name,
@@ -427,7 +434,7 @@ router.get('/settings', async (req, res) => {
   }
 });
 
-router.put('/settings', async (req, res) => {
+router.put('/settings', sanitizeBody, async (req, res) => {
   try {
     const { businessName, businessAddress, pickupAddress, bankDetails, phone, bio } = req.body;
     const user = req.user;
@@ -476,7 +483,7 @@ router.post('/shipping/serviceability', async (req, res) => {
       console.log('[Shipping] Not seller\'s order'); return res.status(403).json({ message: 'Not your order' });
     }
 
-    const seller = await User.findById(req.user._id);
+    const seller = await Seller.findById(req.user._id);
     const pickupPincode = seller.sellerProfile?.pickupAddress?.pincode || seller.sellerProfile?.businessAddress?.pincode;
     console.log('[Shipping] Pickup pincode:', pickupPincode, ', Seller profile:', JSON.stringify(seller.sellerProfile?.pickupAddress || seller.sellerProfile?.businessAddress || 'NONE'));
     if (!pickupPincode) return res.status(400).json({ message: 'Set your pickup address pincode in Seller Settings first' });
@@ -517,7 +524,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     const existing = await Shipment.findOne({ orderId: order._id });
     if (existing && existing.shiprocketOrderId) return res.status(400).json({ message: 'Shipment already created', shipment: existing });
 
-    const seller = await User.findById(req.user._id);
+    const seller = await Seller.findById(req.user._id);
     const { weight = 500, length = 10, width = 10, height = 10 } = req.body;
 
     const shiprocketData = {
@@ -656,6 +663,7 @@ router.post('/request-unsuspend', async (req, res) => {
     user.sellerProfile.suspensionRemovalReason = reason.trim();
     await user.save();
 
+    logActivity({ domain: 'seller', action: 'unsuspend_requested', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Seller', targetId: user._id, message: `Seller requested unsuspension: ${reason.trim().substring(0, 100)}` });
     res.json({ message: 'Suspension removal request submitted. Admin will review.' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
