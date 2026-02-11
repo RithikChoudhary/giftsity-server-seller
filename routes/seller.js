@@ -540,7 +540,7 @@ router.get('/settings', async (req, res) => {
 
 router.put('/settings', sanitizeBody, async (req, res) => {
   try {
-    const { businessName, businessAddress, pickupAddress, bankDetails, phone, bio } = req.body;
+    const { businessName, businessAddress, pickupAddress, bankDetails, phone, bio, businessType, gstNumber, instagramUsername } = req.body;
     const user = req.user;
 
     if (businessName) user.sellerProfile.businessName = businessName;
@@ -549,11 +549,68 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     if (bankDetails) user.sellerProfile.bankDetails = bankDetails;
     if (bio !== undefined) user.sellerProfile.bio = bio;
     if (phone) user.phone = phone;
+    if (businessType !== undefined) user.sellerProfile.businessType = businessType;
+    if (gstNumber !== undefined) user.sellerProfile.gstNumber = gstNumber;
+    if (instagramUsername !== undefined) user.sellerProfile.instagramUsername = instagramUsername.replace('@', '').trim();
 
     await user.save();
     res.json({ message: 'Settings updated' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/seller/upload-image - upload avatar or cover image
+router.post('/upload-image', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    const { type } = req.body; // 'avatar' or 'cover'
+    if (!type || !['avatar', 'cover'].includes(type)) {
+      return res.status(400).json({ message: 'Type must be "avatar" or "cover"' });
+    }
+
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!allowedMimes.includes(req.file.mimetype)) {
+      return res.status(400).json({ message: 'Only JPEG, PNG, WebP, and GIF images are allowed' });
+    }
+
+    const seller = await Seller.findById(req.user._id);
+    if (!seller) return res.status(404).json({ message: 'Seller not found' });
+
+    const folder = `giftsity/sellers/${seller._id}/${type}`;
+    const transformation = type === 'avatar'
+      ? [{ width: 400, height: 400, crop: 'fill', gravity: 'face' }]
+      : [{ width: 1200, height: 400, crop: 'fill', gravity: 'auto' }];
+
+    // Delete old image if exists
+    const oldField = type === 'avatar' ? seller.sellerProfile.avatar : seller.sellerProfile.coverImage;
+    if (oldField?.publicId) {
+      try { await deleteImage(oldField.publicId); } catch {}
+    }
+
+    // Upload new image
+    const result = await new Promise((resolve, reject) => {
+      const { cloudinary: cld } = require('../../server/config/cloudinary');
+      const stream = cld.uploader.upload_stream(
+        { folder, transformation },
+        (err, result) => err ? reject(err) : resolve(result)
+      );
+      stream.end(req.file.buffer);
+    });
+
+    // Update seller profile
+    if (type === 'avatar') {
+      seller.sellerProfile.avatar = { url: result.secure_url, publicId: result.public_id };
+    } else {
+      seller.sellerProfile.coverImage = { url: result.secure_url, publicId: result.public_id };
+    }
+    await seller.save();
+
+    res.json({ url: result.secure_url, publicId: result.public_id });
+  } catch (err) {
+    console.error('Seller upload image error:', err);
+    res.status(500).json({ message: 'Upload failed' });
   }
 });
 
