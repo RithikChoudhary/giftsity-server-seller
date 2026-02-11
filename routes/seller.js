@@ -336,6 +336,93 @@ router.delete('/products/:id', async (req, res) => {
   }
 });
 
+// =================== BULK CSV UPLOAD ===================
+const csvUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max CSV
+
+router.post('/products/bulk-csv', csvUpload.single('csv'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No CSV file provided' });
+
+    const content = req.file.buffer.toString('utf-8');
+    const lines = content.split(/\r?\n/).filter(l => l.trim());
+    if (lines.length < 2) return res.status(400).json({ message: 'CSV must have a header row and at least one data row' });
+
+    // Parse header
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const requiredCols = ['title', 'price', 'stock', 'category'];
+    for (const col of requiredCols) {
+      if (!headers.includes(col)) {
+        return res.status(400).json({ message: `Missing required column: ${col}. Required: ${requiredCols.join(', ')}` });
+      }
+    }
+
+    const results = { success: 0, failed: 0, errors: [] };
+    const Category = require('../../server/models/Category');
+    const categories = await Category.find().lean();
+    const catMap = {};
+    for (const c of categories) {
+      catMap[c.name.toLowerCase()] = c._id;
+      catMap[c.slug?.toLowerCase()] = c._id;
+    }
+
+    for (let i = 1; i < lines.length; i++) {
+      try {
+        // Simple CSV parse (handles quoted fields with commas)
+        const vals = [];
+        let current = '';
+        let inQuotes = false;
+        for (const ch of lines[i]) {
+          if (ch === '"') { inQuotes = !inQuotes; }
+          else if (ch === ',' && !inQuotes) { vals.push(current.trim()); current = ''; }
+          else { current += ch; }
+        }
+        vals.push(current.trim());
+
+        const row = {};
+        headers.forEach((h, idx) => { row[h] = vals[idx] || ''; });
+
+        // Validate
+        if (!row.title) { results.errors.push({ row: i + 1, error: 'Title is required' }); results.failed++; continue; }
+        const price = parseFloat(row.price);
+        if (isNaN(price) || price <= 0) { results.errors.push({ row: i + 1, error: 'Invalid price' }); results.failed++; continue; }
+        const stock = parseInt(row.stock);
+        if (isNaN(stock) || stock < 0) { results.errors.push({ row: i + 1, error: 'Invalid stock' }); results.failed++; continue; }
+
+        const categoryId = catMap[row.category.toLowerCase()];
+        if (!categoryId) { results.errors.push({ row: i + 1, error: `Category "${row.category}" not found` }); results.failed++; continue; }
+
+        const slug = slugify(row.title);
+        const product = new Product({
+          title: row.title,
+          description: row.description || '',
+          price,
+          compareAtPrice: row.compareatprice ? parseFloat(row.compareatprice) : undefined,
+          stock,
+          category: categoryId,
+          sellerId: req.user._id,
+          slug,
+          sku: row.sku || '',
+          tags: row.tags ? row.tags.split(';').map(t => t.trim()).filter(Boolean) : [],
+          images: [],
+          media: [],
+          isActive: true
+        });
+        await product.save();
+        results.success++;
+      } catch (rowErr) {
+        results.errors.push({ row: i + 1, error: rowErr.message });
+        results.failed++;
+      }
+    }
+
+    logActivity({ domain: 'seller', action: 'bulk_csv_upload', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, message: `Bulk CSV: ${results.success} created, ${results.failed} failed` });
+    res.json({ message: `Import complete: ${results.success} products created, ${results.failed} failed`, ...results });
+  } catch (err) {
+    console.error('Bulk CSV error:', err.message);
+    res.status(500).json({ message: 'Failed to process CSV' });
+  }
+});
+
 // =================== ORDERS ===================
 router.get('/orders', async (req, res) => {
   try {
@@ -492,26 +579,21 @@ router.get('/marketing', async (req, res) => {
 // =================== SHIPPING (Shiprocket) ===================
 router.post('/shipping/serviceability', async (req, res) => {
   try {
-    console.log('[Shipping] Serviceability check started, orderId:', req.body.orderId);
     const { orderId } = req.body;
     const order = await Order.findById(orderId);
-    if (!order) { console.log('[Shipping] Order not found'); return res.status(404).json({ message: 'Order not found' }); }
+    if (!order) return res.status(404).json({ message: 'Order not found' });
     if (order.sellerId.toString() !== req.user._id.toString()) {
-      console.log('[Shipping] Not seller\'s order'); return res.status(403).json({ message: 'Not your order' });
+      return res.status(403).json({ message: 'Not your order' });
     }
 
     const seller = await Seller.findById(req.user._id);
     const pickupPincode = seller.sellerProfile?.pickupAddress?.pincode || seller.sellerProfile?.businessAddress?.pincode;
-    console.log('[Shipping] Pickup pincode:', pickupPincode, ', Seller profile:', JSON.stringify(seller.sellerProfile?.pickupAddress || seller.sellerProfile?.businessAddress || 'NONE'));
     if (!pickupPincode) return res.status(400).json({ message: 'Set your pickup address pincode in Seller Settings first' });
 
     const deliveryPincode = order.shippingAddress?.pincode;
-    console.log('[Shipping] Delivery pincode:', deliveryPincode);
     if (!deliveryPincode) return res.status(400).json({ message: 'Order has no delivery pincode' });
 
     const result = await shiprocket.checkServiceability({ pickupPincode, deliveryPincode, weight: 500, cod: 0 });
-    console.log('[Shipping] Shiprocket response keys:', Object.keys(result || {}));
-    console.log('[Shipping] Available couriers count:', result?.data?.available_courier_companies?.length || result?.available_courier_companies?.length || 0);
 
     const companies = result?.data?.available_courier_companies || result?.available_courier_companies || [];
     const couriers = companies.map(c => ({
@@ -639,7 +721,7 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
 
 router.get('/shipping/:orderId/track', async (req, res) => {
   try {
-    const shipment = await Shipment.findOne({ orderId: req.params.orderId });
+    const shipment = await Shipment.findOne({ orderId: req.params.orderId, sellerId: req.user._id });
     if (!shipment) return res.status(404).json({ message: 'No shipment' });
 
     if (shipment.awbCode) {
