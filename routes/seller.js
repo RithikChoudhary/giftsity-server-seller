@@ -374,6 +374,15 @@ router.put('/orders/:id/status', async (req, res) => {
       } catch (e) { console.error('Delivered email error:', e.message); }
     }
     await order.save();
+
+    // Send corporate order status email for B2B orders
+    if (order.orderType === 'b2b_direct' && ['shipped', 'delivered', 'cancelled'].includes(status)) {
+      try {
+        const { sendCorporateOrderStatusEmail } = require('../../server/utils/email');
+        if (order.customerEmail) await sendCorporateOrderStatusEmail(order.customerEmail, order, status);
+      } catch (e) { console.error('Corporate status email error:', e.message); }
+    }
+
     logActivity({ domain: 'seller', action: `order_${status}`, actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} marked as ${status}` });
     res.json({ order, message: `Order ${status}` });
   } catch (err) {
@@ -401,6 +410,14 @@ router.put('/orders/:id/ship', async (req, res) => {
       const { sendShippedEmail } = require('../../server/utils/email');
       if (order.customerEmail) await sendShippedEmail(order.customerEmail, order);
     } catch (e) { console.error('Shipped email error:', e.message); }
+
+    // Send corporate order status email for B2B orders
+    if (order.orderType === 'b2b_direct') {
+      try {
+        const { sendCorporateOrderStatusEmail } = require('../../server/utils/email');
+        if (order.customerEmail) await sendCorporateOrderStatusEmail(order.customerEmail, order, 'shipped');
+      } catch (e) { console.error('Corporate shipped email error:', e.message); }
+    }
 
     logActivity({ domain: 'seller', action: 'order_shipped', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} shipped via ${courierName || 'unknown'}`, metadata: { courierName, trackingNumber } });
     res.json({ order, message: 'Order marked as shipped' });
