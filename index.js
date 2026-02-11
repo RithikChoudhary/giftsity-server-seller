@@ -4,6 +4,7 @@ const cors = require('cors');
 const connectDB = require('../server/config/db');
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.SELLER_PORT || 5001;
 
 // Middleware - CORS supports comma-separated origins in CLIENT_URL
