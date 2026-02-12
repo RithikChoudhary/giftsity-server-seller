@@ -1,11 +1,19 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const connectDB = require('../server/config/db');
 
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.SELLER_PORT || 5001;
+
+// Security headers
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// Compression
+app.use(compression());
 
 // Middleware - CORS supports comma-separated origins in CLIENT_URL
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map(s => s.trim());
