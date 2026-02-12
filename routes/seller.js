@@ -13,10 +13,33 @@ const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
 const { sanitizeBody } = require('../../server/middleware/sanitize');
 const { logActivity } = require('../../server/utils/audit');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
 
+// Rate limiters for seller product endpoints
+const productCreationLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyGenerator: (req) => req.user?._id?.toString() || 'unknown',
+  message: { message: 'Too many product creation requests. Please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+const csvUploadLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 3,
+  keyGenerator: (req) => req.user?._id?.toString() || 'unknown',
+  message: { message: 'Too many CSV uploads. Please wait a few minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 router.use(requireAuth, requireSeller);
+
+// Allowed MIME types for seller product uploads
+const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const ALLOWED_VIDEO_MIMES = ['video/mp4', 'video/webm', 'video/quicktime'];
 
 // =================== DASHBOARD ===================
 router.get('/dashboard', async (req, res) => {
@@ -89,7 +112,7 @@ router.get('/products', async (req, res) => {
   }
 });
 
-router.post('/products', upload.array('media', 15), sanitizeBody, async (req, res) => {
+router.post('/products', productCreationLimiter, upload.array('media', 15), sanitizeBody, async (req, res) => {
   const allUploadedPublicIds = []; // Track for cleanup on failure
   try {
     const sellerId = req.user._id;
@@ -102,6 +125,17 @@ router.post('/products', upload.array('media', 15), sanitizeBody, async (req, re
 
     // Handle uploaded files (images + videos via multipart)
     if (req.files && req.files.length > 0) {
+      // Validate MIME types before processing any files
+      for (const file of req.files) {
+        const isVideo = file.mimetype.startsWith('video/');
+        if (isVideo && !ALLOWED_VIDEO_MIMES.includes(file.mimetype)) {
+          return res.status(400).json({ message: `Invalid video type: ${file.mimetype}. Allowed: ${ALLOWED_VIDEO_MIMES.join(', ')}` });
+        }
+        if (!isVideo && !ALLOWED_IMAGE_MIMES.includes(file.mimetype)) {
+          return res.status(400).json({ message: `Invalid image type: ${file.mimetype}. Allowed: ${ALLOWED_IMAGE_MIMES.join(', ')}` });
+        }
+      }
+
       for (const file of req.files) {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
         const isVideo = file.mimetype.startsWith('video/');
@@ -120,9 +154,14 @@ router.post('/products', upload.array('media', 15), sanitizeBody, async (req, re
     }
 
     // Also handle base64 strings sent in body (backward compat)
+    const MAX_BASE64_IMAGE_SIZE = 10 * 1024 * 1024; // ~7.5MB decoded
+    const MAX_BASE64_VIDEO_SIZE = 100 * 1024 * 1024; // ~75MB decoded
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
+          if (img.length > MAX_BASE64_IMAGE_SIZE) {
+            return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
+          }
           const result = await uploadImage(img, { folder: sellerFolder });
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
@@ -136,6 +175,9 @@ router.post('/products', upload.array('media', 15), sanitizeBody, async (req, re
     if (data.newVideos && Array.isArray(data.newVideos)) {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
+          if (vid.length > MAX_BASE64_VIDEO_SIZE) {
+            return res.status(400).json({ message: 'Base64 video too large (max ~75MB)' });
+          }
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
@@ -201,6 +243,17 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     const uploadedImages = [];
     const uploadedMedia = [];
     if (req.files && req.files.length > 0) {
+      // Validate MIME types before processing any files
+      for (const file of req.files) {
+        const isVideo = file.mimetype.startsWith('video/');
+        if (isVideo && !ALLOWED_VIDEO_MIMES.includes(file.mimetype)) {
+          return res.status(400).json({ message: `Invalid video type: ${file.mimetype}. Allowed: ${ALLOWED_VIDEO_MIMES.join(', ')}` });
+        }
+        if (!isVideo && !ALLOWED_IMAGE_MIMES.includes(file.mimetype)) {
+          return res.status(400).json({ message: `Invalid image type: ${file.mimetype}. Allowed: ${ALLOWED_IMAGE_MIMES.join(', ')}` });
+        }
+      }
+
       for (const file of req.files) {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
         const isVideo = file.mimetype.startsWith('video/');
@@ -222,6 +275,9 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
+          if (img.length > 10 * 1024 * 1024) {
+            return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
+          }
           const result = await uploadImage(img, { folder: sellerFolder });
           newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
@@ -235,6 +291,9 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     if (data.newVideos && Array.isArray(data.newVideos)) {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
+          if (vid.length > 100 * 1024 * 1024) {
+            return res.status(400).json({ message: 'Base64 video too large (max ~75MB)' });
+          }
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
           newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
@@ -338,8 +397,10 @@ router.delete('/products/:id', async (req, res) => {
 
 // =================== BULK CSV UPLOAD ===================
 const csvUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max CSV
+const sanitizeHtml = require('sanitize-html');
+const csvClean = (str, maxLen = 500) => sanitizeHtml(str || '', { allowedTags: [], allowedAttributes: {} }).substring(0, maxLen);
 
-router.post('/products/bulk-csv', csvUpload.single('csv'), async (req, res) => {
+router.post('/products/bulk-csv', csvUploadLimiter, csvUpload.single('csv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No CSV file provided' });
 
@@ -391,18 +452,21 @@ router.post('/products/bulk-csv', csvUpload.single('csv'), async (req, res) => {
         const categoryId = catMap[row.category.toLowerCase()];
         if (!categoryId) { results.errors.push({ row: i + 1, error: `Category "${row.category}" not found` }); results.failed++; continue; }
 
-        const slug = slugify(row.title);
+        const cleanTitle = csvClean(row.title, 200);
+        const cleanDescription = csvClean(row.description, 5000);
+        const cleanSku = csvClean(row.sku, 100);
+        const slug = slugify(cleanTitle);
         const product = new Product({
-          title: row.title,
-          description: row.description || '',
+          title: cleanTitle,
+          description: cleanDescription,
           price,
           compareAtPrice: row.compareatprice ? parseFloat(row.compareatprice) : undefined,
           stock,
           category: categoryId,
           sellerId: req.user._id,
           slug,
-          sku: row.sku || '',
-          tags: row.tags ? row.tags.split(';').map(t => t.trim()).filter(Boolean) : [],
+          sku: cleanSku,
+          tags: row.tags ? row.tags.split(';').map(t => csvClean(t, 50)).filter(Boolean) : [],
           images: [],
           media: [],
           isActive: true
@@ -571,8 +635,9 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     }
 
     // Register/update Shiprocket pickup location when pickupAddress changes
+    // Skip Shiprocket operations for suspended sellers
     let shiprocketPickupStatus = null;
-    if (pickupAddress && pickupAddress.street && pickupAddress.city && pickupAddress.pincode) {
+    if (pickupAddress && pickupAddress.street && pickupAddress.city && pickupAddress.pincode && user.status !== 'suspended') {
       const locationName = `seller-${user._id.toString().slice(-8)}`;
       const pickupPhone = pickupAddress.phone || user.phone;
       if (!pickupPhone) {
@@ -791,7 +856,11 @@ router.post('/shipping/:orderId/create', async (req, res) => {
       }
     }
 
-    const { weight = 500, length = 10, width = 10, height = 10 } = req.body;
+    // Validate and clamp weight/dimensions to reasonable bounds
+    const weight = Math.max(50, Math.min(50000, Number(req.body.weight) || 500));   // 50g to 50kg
+    const length = Math.max(1, Math.min(200, Number(req.body.length) || 10));       // 1cm to 200cm
+    const width = Math.max(1, Math.min(200, Number(req.body.width) || 10));         // 1cm to 200cm
+    const height = Math.max(1, Math.min(200, Number(req.body.height) || 10));       // 1cm to 200cm
 
     // Use seller's registered Shiprocket pickup location, fall back to fetching from API
     let pickupLocationName = seller.sellerProfile?.shiprocketPickupLocation || '';
