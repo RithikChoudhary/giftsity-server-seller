@@ -551,11 +551,61 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     if (phone) user.phone = phone;
     if (businessType !== undefined) user.sellerProfile.businessType = businessType;
     if (gstNumber !== undefined) user.sellerProfile.gstNumber = gstNumber;
-    if (instagramUsername !== undefined) user.sellerProfile.instagramUsername = instagramUsername.replace('@', '').trim();
+    if (instagramUsername !== undefined) {
+      const cleanUsername = instagramUsername.replace('@', '').trim();
+      if (cleanUsername && cleanUsername !== user.sellerProfile.instagramUsername) {
+        // Verify Instagram username exists
+        try {
+          const { verifyInstagramUsername } = require('../../server/utils/instagram');
+          const igResult = await verifyInstagramUsername(cleanUsername);
+          if (!igResult.exists) {
+            return res.status(400).json({ message: `Instagram account @${cleanUsername} not found. Please enter a valid username.` });
+          }
+          user.sellerProfile.instagramVerified = true;
+        } catch (igErr) {
+          console.warn('[Instagram] Verification failed, allowing save:', igErr.message);
+          // Allow save if verification service is down
+        }
+      }
+      user.sellerProfile.instagramUsername = cleanUsername;
+    }
+
+    // Register/update Shiprocket pickup location when pickupAddress changes
+    if (pickupAddress && pickupAddress.street && pickupAddress.city && pickupAddress.pincode) {
+      try {
+        const locationName = `seller-${user._id.toString().slice(-8)}`;
+        const pickupPhone = pickupAddress.phone || user.phone;
+        if (pickupPhone) {
+          await shiprocket.addPickupLocation({
+            pickupLocationName: locationName,
+            name: user.sellerProfile.businessName || user.name || locationName,
+            email: user.email,
+            phone: pickupPhone,
+            address: pickupAddress.street,
+            city: pickupAddress.city,
+            state: pickupAddress.state,
+            pinCode: pickupAddress.pincode,
+            country: 'India'
+          });
+          user.sellerProfile.shiprocketPickupLocation = locationName;
+          console.log(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}`);
+        }
+      } catch (pickupErr) {
+        // If it's a duplicate name error, the location already exists — that's fine
+        const errMsg = pickupErr?.response?.data?.message || pickupErr.message || '';
+        if (errMsg.toLowerCase().includes('already')) {
+          user.sellerProfile.shiprocketPickupLocation = `seller-${user._id.toString().slice(-8)}`;
+          console.log(`[Shiprocket] Pickup location already exists for seller ${user._id}`);
+        } else {
+          console.error('[Shiprocket] Failed to register pickup:', errMsg);
+        }
+      }
+    }
 
     await user.save();
     res.json({ message: 'Settings updated' });
   } catch (err) {
+    console.error('Settings update error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -683,18 +733,23 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     const seller = await Seller.findById(req.user._id);
     const { weight = 500, length = 10, width = 10, height = 10 } = req.body;
 
-    // Fetch registered pickup locations from Shiprocket and use the first active one
-    let pickupLocationName = 'Primary';
-    try {
-      const pickupLocations = await shiprocket.getPickupLocations();
-      const active = pickupLocations.find(loc => loc.status === 2) || pickupLocations[0];
-      if (active?.pickup_location) {
-        pickupLocationName = active.pickup_location;
+    // Use seller's registered Shiprocket pickup location, fall back to fetching from API
+    let pickupLocationName = seller.sellerProfile?.shiprocketPickupLocation || '';
+    if (!pickupLocationName) {
+      try {
+        const pickupLocations = await shiprocket.getPickupLocations();
+        const active = pickupLocations.find(loc => loc.status === 2) || pickupLocations[0];
+        if (active?.pickup_location) {
+          pickupLocationName = active.pickup_location;
+        }
+      } catch (pickupErr) {
+        console.warn('[Shiprocket] Could not fetch pickup locations:', pickupErr.message);
       }
-      console.log(`[Shiprocket] Using pickup location: "${pickupLocationName}"`);
-    } catch (pickupErr) {
-      console.warn('[Shiprocket] Could not fetch pickup locations, using default:', pickupErr.message);
     }
+    if (!pickupLocationName) {
+      return res.status(400).json({ message: 'No pickup location configured. Please save your pickup address in Seller Settings first.' });
+    }
+    console.log(`[Shiprocket] Using pickup location: "${pickupLocationName}" for seller ${seller._id}`);
 
     const shiprocketData = {
       order_id: order.orderNumber,
