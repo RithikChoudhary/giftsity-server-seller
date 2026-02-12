@@ -13,6 +13,7 @@ const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
 const { sanitizeBody } = require('../../server/middleware/sanitize');
 const { logActivity } = require('../../server/utils/audit');
+const logger = require('../../server/utils/logger');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
@@ -116,7 +117,15 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
   const allUploadedPublicIds = []; // Track for cleanup on failure
   try {
     const sellerId = req.user._id;
-    const data = { ...req.body, sellerId };
+    const data = { ...req.body };
+    // Strip fields that sellers must not control
+    delete data.isFeatured;
+    delete data.orderCount;
+    delete data.viewCount;
+    delete data.averageRating;
+    delete data.reviewCount;
+    delete data.isActive; // admin-controlled on create
+    data.sellerId = sellerId;
     data.slug = slugify(data.title);
 
     const sellerFolder = `giftsity/products/${sellerId}`;
@@ -210,7 +219,7 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
     for (const item of allUploadedPublicIds) {
       await deleteMedia(item.publicId, item.type).catch(() => {});
     }
-    console.error('Create product error:', err.message);
+    logger.error('Create product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
@@ -223,6 +232,13 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
     const data = { ...req.body, updatedAt: Date.now() };
+    // Strip fields that sellers must not control
+    delete data.isFeatured;
+    delete data.sellerId;
+    delete data.orderCount;
+    delete data.viewCount;
+    delete data.averageRating;
+    delete data.reviewCount;
     const sellerFolder = `giftsity/products/${sellerId}`;
 
     // Parse existing images from JSON string (sent via FormData)
@@ -361,7 +377,7 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     for (const item of newUploadedPublicIds) {
       await deleteMedia(item.publicId, item.type).catch(() => {});
     }
-    console.error('Update product error:', err.message);
+    logger.error('Update product error:', err.message);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
@@ -390,7 +406,7 @@ router.delete('/products/:id', async (req, res) => {
     logActivity({ domain: 'seller', action: 'product_deleted', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: req.params.id, message: `Product deleted` });
     res.json({ message: 'Product deleted' });
   } catch (err) {
-    console.error('Delete product error:', err.message);
+    logger.error('Delete product error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -403,6 +419,11 @@ const csvClean = (str, maxLen = 500) => sanitizeHtml(str || '', { allowedTags: [
 router.post('/products/bulk-csv', csvUploadLimiter, csvUpload.single('csv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No CSV file provided' });
+
+    // Validate MIME type to prevent non-CSV uploads
+    if (!['text/csv', 'application/vnd.ms-excel', 'text/plain'].includes(req.file.mimetype)) {
+      return res.status(400).json({ message: 'Invalid file type. Only CSV files are allowed.' });
+    }
 
     const content = req.file.buffer.toString('utf-8');
     const lines = content.split(/\r?\n/).filter(l => l.trim());
@@ -482,7 +503,7 @@ router.post('/products/bulk-csv', csvUploadLimiter, csvUpload.single('csv'), asy
     logActivity({ domain: 'seller', action: 'bulk_csv_upload', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, message: `Bulk CSV: ${results.success} created, ${results.failed} failed` });
     res.json({ message: `Import complete: ${results.success} products created, ${results.failed} failed`, ...results });
   } catch (err) {
-    console.error('Bulk CSV error:', err.message);
+    logger.error('Bulk CSV error:', err.message);
     res.status(500).json({ message: 'Failed to process CSV' });
   }
 });
@@ -492,7 +513,7 @@ router.get('/orders', async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
     const filter = { sellerId: req.user._id };
-    if (status) filter.status = status;
+    if (status && typeof status === 'string') filter.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const orders = await Order.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).populate('customerId', 'name email phone');
@@ -522,7 +543,7 @@ router.put('/orders/:id/status', async (req, res) => {
       try {
         const { sendDeliveredEmail } = require('../../server/utils/email');
         if (order.customerEmail) await sendDeliveredEmail(order.customerEmail, order);
-      } catch (e) { console.error('Delivered email error:', e.message); }
+      } catch (e) { logger.error('Delivered email error:', e.message); }
     }
     await order.save();
 
@@ -531,7 +552,7 @@ router.put('/orders/:id/status', async (req, res) => {
       try {
         const { sendCorporateOrderStatusEmail } = require('../../server/utils/email');
         if (order.customerEmail) await sendCorporateOrderStatusEmail(order.customerEmail, order, status);
-      } catch (e) { console.error('Corporate status email error:', e.message); }
+      } catch (e) { logger.error('Corporate status email error:', e.message); }
     }
 
     logActivity({ domain: 'seller', action: `order_${status}`, actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} marked as ${status}` });
@@ -547,6 +568,11 @@ router.put('/orders/:id/ship', async (req, res) => {
     const order = await Order.findOne({ _id: req.params.id, sellerId: req.user._id });
     if (!order) return res.status(404).json({ message: 'Order not found' });
 
+    const { isValidTransition } = require('../../server/utils/orderStatus');
+    if (!isValidTransition(order.status, 'shipped')) {
+      return res.status(400).json({ message: `Cannot ship order with status "${order.status}"` });
+    }
+
     order.status = 'shipped';
     order.trackingInfo = {
       courierName: courierName || '',
@@ -560,14 +586,14 @@ router.put('/orders/:id/ship', async (req, res) => {
     try {
       const { sendShippedEmail } = require('../../server/utils/email');
       if (order.customerEmail) await sendShippedEmail(order.customerEmail, order);
-    } catch (e) { console.error('Shipped email error:', e.message); }
+    } catch (e) { logger.error('Shipped email error:', e.message); }
 
     // Send corporate order status email for B2B orders
     if (order.orderType === 'b2b_direct') {
       try {
         const { sendCorporateOrderStatusEmail } = require('../../server/utils/email');
         if (order.customerEmail) await sendCorporateOrderStatusEmail(order.customerEmail, order, 'shipped');
-      } catch (e) { console.error('Corporate shipped email error:', e.message); }
+      } catch (e) { logger.error('Corporate shipped email error:', e.message); }
     }
 
     logActivity({ domain: 'seller', action: 'order_shipped', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} shipped via ${courierName || 'unknown'}`, metadata: { courierName, trackingNumber } });
@@ -627,7 +653,7 @@ router.put('/settings', sanitizeBody, async (req, res) => {
           }
           user.sellerProfile.instagramVerified = true;
         } catch (igErr) {
-          console.warn('[Instagram] Verification failed, allowing save:', igErr.message);
+          logger.warn('[Instagram] Verification failed, allowing save:', igErr.message);
           // Allow save if verification service is down
         }
       }
@@ -641,7 +667,7 @@ router.put('/settings', sanitizeBody, async (req, res) => {
       const locationName = `seller-${user._id.toString().slice(-8)}`;
       const pickupPhone = pickupAddress.phone || user.phone;
       if (!pickupPhone) {
-        console.warn(`[Shiprocket] No phone for pickup location, skipping registration for seller ${user._id}`);
+        logger.warn(`[Shiprocket] No phone for pickup location, skipping registration for seller ${user._id}`);
       } else {
         const locationPayload = {
           pickupLocationName: locationName,
@@ -659,11 +685,11 @@ router.put('/settings', sanitizeBody, async (req, res) => {
           const addResult = await shiprocket.addPickupLocation(locationPayload);
           user.sellerProfile.shiprocketPickupLocation = locationName;
           shiprocketPickupStatus = 'registered';
-          console.log(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(addResult));
+          logger.info(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(addResult));
         } catch (pickupErr) {
           const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data?.errors || pickupErr.message || '';
           const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
-          console.warn(`[Shiprocket] addPickupLocation failed for seller ${user._id}:`, errStr);
+          logger.warn(`[Shiprocket] addPickupLocation failed for seller ${user._id}:`, errStr);
 
           // If duplicate/already exists, try to update the existing location instead
           if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('duplicate') || errStr.toLowerCase().includes('exists')) {
@@ -671,16 +697,16 @@ router.put('/settings', sanitizeBody, async (req, res) => {
               const updateResult = await shiprocket.updatePickupLocation(locationPayload);
               user.sellerProfile.shiprocketPickupLocation = locationName;
               shiprocketPickupStatus = 'updated';
-              console.log(`[Shiprocket] Updated existing pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(updateResult));
+              logger.info(`[Shiprocket] Updated existing pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(updateResult));
             } catch (updateErr) {
               const updateErrMsg = updateErr?.response?.data?.message || updateErr?.response?.data?.errors || updateErr.message || '';
-              console.error(`[Shiprocket] updatePickupLocation also failed for seller ${user._id}:`, typeof updateErrMsg === 'string' ? updateErrMsg : JSON.stringify(updateErrMsg));
+              logger.error(`[Shiprocket] updatePickupLocation also failed for seller ${user._id}:`, typeof updateErrMsg === 'string' ? updateErrMsg : JSON.stringify(updateErrMsg));
               // Still set the location name since the location exists on Shiprocket
               user.sellerProfile.shiprocketPickupLocation = locationName;
               shiprocketPickupStatus = 'exists_update_failed';
             }
           } else {
-            console.error('[Shiprocket] Failed to register pickup (non-duplicate error):', errStr);
+            logger.error('[Shiprocket] Failed to register pickup (non-duplicate error):', errStr);
             shiprocketPickupStatus = 'failed';
           }
         }
@@ -692,10 +718,10 @@ router.put('/settings', sanitizeBody, async (req, res) => {
           if (thisLocation) {
             const isVerified = thisLocation.phone_verified === 1;
             user.sellerProfile.shiprocketPickupVerified = isVerified;
-            console.log(`[Shiprocket] Pickup "${locationName}" phone_verified=${thisLocation.phone_verified} (${isVerified ? 'verified' : 'unverified'})`);
+            logger.info(`[Shiprocket] Pickup "${locationName}" phone_verified=${thisLocation.phone_verified} (${isVerified ? 'verified' : 'unverified'})`);
           }
         } catch (verifyErr) {
-          console.warn('[Shiprocket] Could not check pickup verification status:', verifyErr.message);
+          logger.warn('[Shiprocket] Could not check pickup verification status:', verifyErr.message);
         }
       }
     }
@@ -703,7 +729,7 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     await user.save();
     res.json({ message: 'Settings updated', shiprocketPickupStatus, shiprocketPickupVerified: user.sellerProfile.shiprocketPickupVerified || false });
   } catch (err) {
-    console.error('Settings update error:', err.message);
+    logger.error('Settings update error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -757,7 +783,7 @@ router.post('/upload-image', upload.single('image'), async (req, res) => {
 
     res.json({ url: result.secure_url, publicId: result.public_id });
   } catch (err) {
-    console.error('Seller upload image error:', err);
+    logger.error('Seller upload image error:', err);
     res.status(500).json({ message: 'Upload failed' });
   }
 });
@@ -810,10 +836,10 @@ router.post('/shipping/serviceability', async (req, res) => {
       rating: c.rating
     }));
 
-    console.log('[Shipping] Returning', couriers.length, 'couriers');
+    logger.info('[Shipping] Returning', couriers.length, 'couriers');
     res.json({ couriers, pickupPincode, deliveryPincode });
   } catch (err) {
-    console.error('Serviceability error:', err?.response?.data || err.message);
+    logger.error('Serviceability error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to check serviceability', error: err?.response?.data?.message || err.message });
   }
 });
@@ -845,7 +871,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
             justVerified = true;
           }
         } catch (e) {
-          console.warn('[Shiprocket] Could not re-check pickup verification:', e.message);
+          logger.warn('[Shiprocket] Could not re-check pickup verification:', e.message);
         }
       }
       if (!justVerified) {
@@ -872,13 +898,13 @@ router.post('/shipping/:orderId/create', async (req, res) => {
           pickupLocationName = active.pickup_location;
         }
       } catch (pickupErr) {
-        console.warn('[Shiprocket] Could not fetch pickup locations:', pickupErr.message);
+        logger.warn('[Shiprocket] Could not fetch pickup locations:', pickupErr.message);
       }
     }
     if (!pickupLocationName) {
       return res.status(400).json({ message: 'No pickup location configured. Please save your pickup address in Seller Settings first.' });
     }
-    console.log(`[Shiprocket] Using pickup location: "${pickupLocationName}" for seller ${seller._id}`);
+    logger.info(`[Shiprocket] Using pickup location: "${pickupLocationName}" for seller ${seller._id}`);
 
     const shiprocketData = {
       order_id: order.orderNumber,
@@ -908,14 +934,14 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     };
 
     const result = await shiprocket.createShiprocketOrder(shiprocketData);
-    console.log('[Shiprocket] Create order response:', JSON.stringify(result, null, 2));
+    logger.info('[Shiprocket] Create order response:', JSON.stringify(result, null, 2));
 
     // Extract IDs from multiple possible response formats
     const srOrderId = (result.order_id || result.payload?.order_id || '').toString();
     const srShipmentId = (result.shipment_id || result.payload?.shipment_id || '').toString();
 
     if (!srOrderId) {
-      console.error('[Shiprocket] No order_id in response:', result);
+      logger.error('[Shiprocket] No order_id in response:', result);
       return res.status(500).json({ message: 'Shiprocket did not return an order ID', shiprocketResponse: result });
     }
 
@@ -929,7 +955,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     await shipment.save();
 
     if (!srShipmentId) {
-      console.warn('[Shiprocket] Shipment created but no shipment_id returned. Courier assignment will need shipment_id.');
+      logger.warn('[Shiprocket] Shipment created but no shipment_id returned. Courier assignment will need shipment_id.');
     }
 
     order.status = 'processing';
@@ -937,7 +963,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
 
     res.json({ message: 'Shipment created', shipment, warning: !srShipmentId ? 'No shipment_id returned — courier assignment may fail until Shiprocket processes this order' : undefined });
   } catch (err) {
-    console.error('Create shipment error:', err?.response?.data || err.message);
+    logger.error('Create shipment error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to create shipment', error: err?.response?.data?.message || err.message });
   }
 });
@@ -962,7 +988,7 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
 
     res.json({ message: 'Courier assigned', shipment });
   } catch (err) {
-    console.error('Assign courier error:', err?.response?.data || err.message);
+    logger.error('Assign courier error:', err?.response?.data || err.message);
     res.status(500).json({ message: err?.response?.data?.message || 'Failed to assign courier', error: err?.response?.data });
   }
 });
@@ -981,9 +1007,12 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
 
     const order = await Order.findById(req.params.orderId);
     if (order) {
-      order.status = 'shipped';
-      order.trackingInfo = { courierName: shipment.courierName, trackingNumber: shipment.awbCode, shippedAt: new Date() };
-      await order.save();
+      const { isValidTransition } = require('../../server/utils/orderStatus');
+      if (isValidTransition(order.status, 'shipped')) {
+        order.status = 'shipped';
+        order.trackingInfo = { courierName: shipment.courierName, trackingNumber: shipment.awbCode, shippedAt: new Date() };
+        await order.save();
+      }
     }
 
     res.json({ message: 'Pickup scheduled', shipment });
@@ -1056,7 +1085,7 @@ router.post('/shipping/verify-pickup', async (req, res) => {
       message: isVerified ? 'Pickup address is verified' : 'Pickup address phone is not verified. Please verify it on the Shiprocket dashboard.'
     });
   } catch (err) {
-    console.error('Verify pickup error:', err?.response?.data || err.message);
+    logger.error('Verify pickup error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to check verification status', error: err?.response?.data?.message || err.message });
   }
 });

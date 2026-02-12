@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const connectDB = require('../server/config/db');
+const logger = require('../server/utils/logger');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -30,6 +31,19 @@ app.use(helmet({
 app.use(compression());
 app.use(express.json({ limit: '100mb' }));
 
+// Request logging
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    logger[level](`${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`, {
+      method: req.method, url: req.originalUrl, status: res.statusCode, duration
+    });
+  });
+  next();
+});
+
 // Routes - all mounted under /api/seller
 app.use('/api/seller', require('./routes/seller'));
 
@@ -43,16 +57,16 @@ app.use((req, res) => {
 
 // Global error handler
 app.use((err, req, res, _next) => {
-  console.error('[Seller Server Error]', err.message);
+  logger.error(`[Seller] ${req.method} ${req.originalUrl} - ${err.message}`, { stack: err.stack });
   res.status(err.status || 500).json({ message: err.message || 'Internal server error' });
 });
 
 // Graceful error handling
 process.on('unhandledRejection', (err) => {
-  console.error('[Unhandled Rejection]', err);
+  logger.error('[Seller] Unhandled Rejection', { error: err?.message || err, stack: err?.stack });
 });
 
 // Start
 connectDB().then(() => {
-  app.listen(PORT, () => console.log(`Giftsity Seller server running on port ${PORT}`));
+  app.listen(PORT, () => logger.info(`Giftsity Seller server running on port ${PORT}`));
 });
