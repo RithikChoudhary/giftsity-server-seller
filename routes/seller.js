@@ -14,6 +14,7 @@ const shiprocket = require('../../server/config/shiprocket');
 const { sanitizeBody } = require('../../server/middleware/sanitize');
 const { logActivity } = require('../../server/utils/audit');
 const logger = require('../../server/utils/logger');
+const { invalidateCache } = require('../../server/middleware/cache');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
@@ -212,6 +213,8 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
 
     const product = new Product(data);
     await product.save();
+    invalidateCache('/api/products');
+    invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_created', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" created` });
     res.status(201).json({ product, message: 'Product created' });
   } catch (err) {
@@ -370,6 +373,8 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
 
     Object.assign(product, data);
     await product.save();
+    invalidateCache('/api/products');
+    invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_updated', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" updated` });
     res.json({ product, message: 'Product updated' });
   } catch (err) {
@@ -403,6 +408,8 @@ router.delete('/products/:id', async (req, res) => {
     }
 
     await Product.findByIdAndDelete(req.params.id);
+    invalidateCache('/api/products');
+    invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_deleted', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: req.params.id, message: `Product deleted` });
     res.json({ message: 'Product deleted' });
   } catch (err) {
@@ -727,6 +734,7 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     }
 
     await user.save();
+    invalidateCache('/api/store/');
     res.json({ message: 'Settings updated', shiprocketPickupStatus, shiprocketPickupVerified: user.sellerProfile.shiprocketPickupVerified || false });
   } catch (err) {
     logger.error('Settings update error:', err.message);
