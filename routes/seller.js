@@ -581,7 +581,7 @@ router.post('/upload-image', upload.single('image'), async (req, res) => {
     const folder = `giftsity/sellers/${seller._id}/${type}`;
     const transformation = type === 'avatar'
       ? [{ width: 400, height: 400, crop: 'fill', gravity: 'face' }]
-      : [{ width: 1200, height: 400, crop: 'fill', gravity: 'auto' }];
+      : [{ width: 1200, height: 400, crop: 'limit', quality: 'auto:good' }];
 
     // Delete old image if exists
     const oldField = type === 'avatar' ? seller.sellerProfile.avatar : seller.sellerProfile.coverImage;
@@ -737,17 +737,22 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
     const shipment = await Shipment.findOne({ orderId: req.params.orderId, sellerId: req.user._id });
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
 
+    if (!shipment.shiprocketShipmentId) {
+      return res.status(400).json({ message: 'Shipment ID missing — please recreate the shipment' });
+    }
+
     const result = await shiprocket.assignCourier({ shipmentId: shipment.shiprocketShipmentId, courierId });
 
-    shipment.awbCode = result.response?.data?.awb_code || '';
-    shipment.courierName = result.response?.data?.courier_name || '';
+    shipment.awbCode = result.response?.data?.awb_code || result.awb_code || '';
+    shipment.courierName = result.response?.data?.courier_name || result.courier_name || '';
     shipment.courierId = courierId;
     shipment.statusHistory.push({ status: 'courier_assigned', description: `Courier: ${shipment.courierName}` });
     await shipment.save();
 
     res.json({ message: 'Courier assigned', shipment });
   } catch (err) {
-    res.status(500).json({ message: 'Failed to assign courier' });
+    console.error('Assign courier error:', err?.response?.data || err.message);
+    res.status(500).json({ message: err?.response?.data?.message || 'Failed to assign courier', error: err?.response?.data });
   }
 });
 
