@@ -683,10 +683,23 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     const seller = await Seller.findById(req.user._id);
     const { weight = 500, length = 10, width = 10, height = 10 } = req.body;
 
+    // Fetch registered pickup locations from Shiprocket and use the first active one
+    let pickupLocationName = 'Primary';
+    try {
+      const pickupLocations = await shiprocket.getPickupLocations();
+      const active = pickupLocations.find(loc => loc.status === 2) || pickupLocations[0];
+      if (active?.pickup_location) {
+        pickupLocationName = active.pickup_location;
+      }
+      console.log(`[Shiprocket] Using pickup location: "${pickupLocationName}"`);
+    } catch (pickupErr) {
+      console.warn('[Shiprocket] Could not fetch pickup locations, using default:', pickupErr.message);
+    }
+
     const shiprocketData = {
       order_id: order.orderNumber,
       order_date: new Date().toISOString().split('T')[0],
-      pickup_location: 'Primary',
+      pickup_location: pickupLocationName,
       billing_customer_name: order.shippingAddress.name || 'Customer',
       billing_last_name: '',
       billing_address: order.shippingAddress.street,
