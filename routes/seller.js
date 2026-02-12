@@ -711,20 +711,34 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     };
 
     const result = await shiprocket.createShiprocketOrder(shiprocketData);
+    console.log('[Shiprocket] Create order response:', JSON.stringify(result, null, 2));
+
+    // Extract IDs from multiple possible response formats
+    const srOrderId = (result.order_id || result.payload?.order_id || '').toString();
+    const srShipmentId = (result.shipment_id || result.payload?.shipment_id || '').toString();
+
+    if (!srOrderId) {
+      console.error('[Shiprocket] No order_id in response:', result);
+      return res.status(500).json({ message: 'Shiprocket did not return an order ID', shiprocketResponse: result });
+    }
 
     const shipment = existing || new Shipment({ orderId: order._id, sellerId: req.user._id });
-    shipment.shiprocketOrderId = result.order_id?.toString() || '';
-    shipment.shiprocketShipmentId = result.shipment_id?.toString() || '';
+    shipment.shiprocketOrderId = srOrderId;
+    shipment.shiprocketShipmentId = srShipmentId;
     shipment.weight = weight;
     shipment.dimensions = { length, width, height };
     shipment.status = 'created';
     shipment.statusHistory.push({ status: 'created', description: 'Shipment created on Shiprocket' });
     await shipment.save();
 
+    if (!srShipmentId) {
+      console.warn('[Shiprocket] Shipment created but no shipment_id returned. Courier assignment will need shipment_id.');
+    }
+
     order.status = 'processing';
     await order.save();
 
-    res.json({ message: 'Shipment created', shipment });
+    res.json({ message: 'Shipment created', shipment, warning: !srShipmentId ? 'No shipment_id returned — courier assignment may fail until Shiprocket processes this order' : undefined });
   } catch (err) {
     console.error('Create shipment error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to create shipment', error: err?.response?.data?.message || err.message });
