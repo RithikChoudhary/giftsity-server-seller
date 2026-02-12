@@ -571,39 +571,72 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     }
 
     // Register/update Shiprocket pickup location when pickupAddress changes
+    let shiprocketPickupStatus = null;
     if (pickupAddress && pickupAddress.street && pickupAddress.city && pickupAddress.pincode) {
-      try {
-        const locationName = `seller-${user._id.toString().slice(-8)}`;
-        const pickupPhone = pickupAddress.phone || user.phone;
-        if (pickupPhone) {
-          await shiprocket.addPickupLocation({
-            pickupLocationName: locationName,
-            name: user.sellerProfile.businessName || user.name || locationName,
-            email: user.email,
-            phone: pickupPhone,
-            address: pickupAddress.street,
-            city: pickupAddress.city,
-            state: pickupAddress.state,
-            pinCode: pickupAddress.pincode,
-            country: 'India'
-          });
+      const locationName = `seller-${user._id.toString().slice(-8)}`;
+      const pickupPhone = pickupAddress.phone || user.phone;
+      if (!pickupPhone) {
+        console.warn(`[Shiprocket] No phone for pickup location, skipping registration for seller ${user._id}`);
+      } else {
+        const locationPayload = {
+          pickupLocationName: locationName,
+          name: user.sellerProfile.businessName || user.name || locationName,
+          email: user.email,
+          phone: pickupPhone,
+          address: pickupAddress.street,
+          city: pickupAddress.city,
+          state: pickupAddress.state,
+          pinCode: pickupAddress.pincode,
+          country: 'India'
+        };
+
+        try {
+          const addResult = await shiprocket.addPickupLocation(locationPayload);
           user.sellerProfile.shiprocketPickupLocation = locationName;
-          console.log(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}`);
+          shiprocketPickupStatus = 'registered';
+          console.log(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(addResult));
+        } catch (pickupErr) {
+          const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data?.errors || pickupErr.message || '';
+          const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
+          console.warn(`[Shiprocket] addPickupLocation failed for seller ${user._id}:`, errStr);
+
+          // If duplicate/already exists, try to update the existing location instead
+          if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('duplicate') || errStr.toLowerCase().includes('exists')) {
+            try {
+              const updateResult = await shiprocket.updatePickupLocation(locationPayload);
+              user.sellerProfile.shiprocketPickupLocation = locationName;
+              shiprocketPickupStatus = 'updated';
+              console.log(`[Shiprocket] Updated existing pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(updateResult));
+            } catch (updateErr) {
+              const updateErrMsg = updateErr?.response?.data?.message || updateErr?.response?.data?.errors || updateErr.message || '';
+              console.error(`[Shiprocket] updatePickupLocation also failed for seller ${user._id}:`, typeof updateErrMsg === 'string' ? updateErrMsg : JSON.stringify(updateErrMsg));
+              // Still set the location name since the location exists on Shiprocket
+              user.sellerProfile.shiprocketPickupLocation = locationName;
+              shiprocketPickupStatus = 'exists_update_failed';
+            }
+          } else {
+            console.error('[Shiprocket] Failed to register pickup (non-duplicate error):', errStr);
+            shiprocketPickupStatus = 'failed';
+          }
         }
-      } catch (pickupErr) {
-        // If it's a duplicate name error, the location already exists — that's fine
-        const errMsg = pickupErr?.response?.data?.message || pickupErr.message || '';
-        if (errMsg.toLowerCase().includes('already')) {
-          user.sellerProfile.shiprocketPickupLocation = `seller-${user._id.toString().slice(-8)}`;
-          console.log(`[Shiprocket] Pickup location already exists for seller ${user._id}`);
-        } else {
-          console.error('[Shiprocket] Failed to register pickup:', errMsg);
+
+        // Check pickup phone verification status from Shiprocket
+        try {
+          const locations = await shiprocket.getPickupLocations();
+          const thisLocation = locations.find(l => l.pickup_location === locationName);
+          if (thisLocation) {
+            const isVerified = thisLocation.phone_verified === 1;
+            user.sellerProfile.shiprocketPickupVerified = isVerified;
+            console.log(`[Shiprocket] Pickup "${locationName}" phone_verified=${thisLocation.phone_verified} (${isVerified ? 'verified' : 'unverified'})`);
+          }
+        } catch (verifyErr) {
+          console.warn('[Shiprocket] Could not check pickup verification status:', verifyErr.message);
         }
       }
     }
 
     await user.save();
-    res.json({ message: 'Settings updated' });
+    res.json({ message: 'Settings updated', shiprocketPickupStatus, shiprocketPickupVerified: user.sellerProfile.shiprocketPickupVerified || false });
   } catch (err) {
     console.error('Settings update error:', err.message);
     res.status(500).json({ message: 'Server error' });
@@ -731,6 +764,33 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     if (existing && existing.shiprocketOrderId) return res.status(400).json({ message: 'Shipment already created', shipment: existing });
 
     const seller = await Seller.findById(req.user._id);
+
+    // Block shipment if pickup address is not phone-verified on Shiprocket
+    if (!seller.sellerProfile?.shiprocketPickupVerified) {
+      // Double-check with Shiprocket API in case it was verified recently
+      const locationName = seller.sellerProfile?.shiprocketPickupLocation;
+      let justVerified = false;
+      if (locationName) {
+        try {
+          const locations = await shiprocket.getPickupLocations();
+          const loc = locations.find(l => l.pickup_location === locationName);
+          if (loc && loc.phone_verified === 1) {
+            seller.sellerProfile.shiprocketPickupVerified = true;
+            await seller.save();
+            justVerified = true;
+          }
+        } catch (e) {
+          console.warn('[Shiprocket] Could not re-check pickup verification:', e.message);
+        }
+      }
+      if (!justVerified) {
+        return res.status(400).json({
+          message: 'Your pickup address phone is not verified on Shiprocket. Please verify it in Seller Settings before creating shipments.',
+          code: 'PICKUP_UNVERIFIED'
+        });
+      }
+    }
+
     const { weight = 500, length = 10, width = 10, height = 10 } = req.body;
 
     // Use seller's registered Shiprocket pickup location, fall back to fetching from API
@@ -891,6 +951,44 @@ router.get('/shipping/:orderId/label', async (req, res) => {
     res.json({ labelUrl: shipment.labelUrl });
   } catch (err) {
     res.status(500).json({ message: 'Failed' });
+  }
+});
+
+// =================== PICKUP VERIFICATION ===================
+router.post('/shipping/verify-pickup', async (req, res) => {
+  try {
+    const seller = await Seller.findById(req.user._id);
+    if (!seller) return res.status(404).json({ message: 'Seller not found' });
+
+    const locationName = seller.sellerProfile?.shiprocketPickupLocation;
+    if (!locationName) {
+      return res.status(400).json({ message: 'No pickup location registered. Save your pickup address in Settings first.', verified: false });
+    }
+
+    const locations = await shiprocket.getPickupLocations();
+    const thisLocation = locations.find(l => l.pickup_location === locationName);
+
+    if (!thisLocation) {
+      return res.json({ verified: false, message: 'Pickup location not found on Shiprocket. Try saving your address again.', locationName });
+    }
+
+    const isVerified = thisLocation.phone_verified === 1;
+
+    // Update the seller's stored verification status
+    if (seller.sellerProfile.shiprocketPickupVerified !== isVerified) {
+      seller.sellerProfile.shiprocketPickupVerified = isVerified;
+      await seller.save();
+    }
+
+    res.json({
+      verified: isVerified,
+      locationName,
+      phone_verified: thisLocation.phone_verified,
+      message: isVerified ? 'Pickup address is verified' : 'Pickup address phone is not verified. Please verify it on the Shiprocket dashboard.'
+    });
+  } catch (err) {
+    console.error('Verify pickup error:', err?.response?.data || err.message);
+    res.status(500).json({ message: 'Failed to check verification status', error: err?.response?.data?.message || err.message });
   }
 });
 
