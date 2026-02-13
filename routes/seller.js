@@ -670,72 +670,92 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     // Register/update Shiprocket pickup location when pickupAddress changes
     // Skip Shiprocket operations for suspended sellers
     let shiprocketPickupStatus = null;
+    let shiprocketError = null;
     if (pickupAddress && pickupAddress.street && pickupAddress.city && pickupAddress.pincode && user.status !== 'suspended') {
-      const locationName = `seller-${user._id.toString().slice(-8)}`;
       const pickupPhone = pickupAddress.phone || user.phone;
       if (!pickupPhone) {
-        logger.warn(`[Shiprocket] No phone for pickup location, skipping registration for seller ${user._id}`);
-      } else {
-        const locationPayload = {
-          pickupLocationName: locationName,
-          name: user.sellerProfile.businessName || user.name || locationName,
-          email: user.email,
-          phone: pickupPhone,
-          address: pickupAddress.street,
-          city: pickupAddress.city,
-          state: pickupAddress.state,
-          pinCode: pickupAddress.pincode,
-          country: 'India'
-        };
+        // Phone is required for Shiprocket pickup registration
+        await user.save();
+        return res.status(400).json({
+          message: 'Phone number is required for pickup address. Please add a phone number.',
+          shiprocketPickupStatus: 'phone_required'
+        });
+      }
 
-        try {
-          const addResult = await shiprocket.addPickupLocation(locationPayload);
-          user.sellerProfile.shiprocketPickupLocation = locationName;
-          shiprocketPickupStatus = 'registered';
-          logger.info(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(addResult));
-        } catch (pickupErr) {
-          const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data?.errors || pickupErr.message || '';
-          const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
-          logger.warn(`[Shiprocket] addPickupLocation failed for seller ${user._id}:`, errStr);
+      // Normalize state name for Shiprocket compatibility
+      const { normalizeState } = require('../../server/utils/indianStates');
+      const normalizedState = normalizeState(pickupAddress.state);
 
-          // If duplicate/already exists, try to update the existing location instead
-          if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('duplicate') || errStr.toLowerCase().includes('exists')) {
-            try {
-              const updateResult = await shiprocket.updatePickupLocation(locationPayload);
-              user.sellerProfile.shiprocketPickupLocation = locationName;
-              shiprocketPickupStatus = 'updated';
-              logger.info(`[Shiprocket] Updated existing pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(updateResult));
-            } catch (updateErr) {
-              const updateErrMsg = updateErr?.response?.data?.message || updateErr?.response?.data?.errors || updateErr.message || '';
-              logger.error(`[Shiprocket] updatePickupLocation also failed for seller ${user._id}:`, typeof updateErrMsg === 'string' ? updateErrMsg : JSON.stringify(updateErrMsg));
-              // Still set the location name since the location exists on Shiprocket
-              user.sellerProfile.shiprocketPickupLocation = locationName;
-              shiprocketPickupStatus = 'exists_update_failed';
-            }
-          } else {
-            logger.error('[Shiprocket] Failed to register pickup (non-duplicate error):', errStr);
-            shiprocketPickupStatus = 'failed';
+      const locationName = `seller-${user._id.toString().slice(-8)}`;
+      const locationPayload = {
+        pickupLocationName: locationName,
+        name: user.sellerProfile.businessName || user.name || locationName,
+        email: user.email,
+        phone: pickupPhone,
+        address: pickupAddress.street,
+        city: pickupAddress.city,
+        state: normalizedState,
+        pinCode: pickupAddress.pincode,
+        country: 'India'
+      };
+
+      try {
+        const addResult = await shiprocket.addPickupLocation(locationPayload);
+        user.sellerProfile.shiprocketPickupLocation = locationName;
+        shiprocketPickupStatus = 'registered';
+        logger.info(`[Shiprocket] Registered pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(addResult));
+      } catch (pickupErr) {
+        const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data?.errors || pickupErr.message || '';
+        const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
+        logger.warn(`[Shiprocket] addPickupLocation failed for seller ${user._id}:`, errStr);
+
+        // If duplicate/already exists, try to update the existing location instead
+        if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('duplicate') || errStr.toLowerCase().includes('exists')) {
+          try {
+            // updatePickupLocation now auto-resolves pickup_id from getPickupLocations()
+            const updateResult = await shiprocket.updatePickupLocation(locationPayload);
+            user.sellerProfile.shiprocketPickupLocation = locationName;
+            shiprocketPickupStatus = 'updated';
+            logger.info(`[Shiprocket] Updated existing pickup "${locationName}" for seller ${user._id}:`, JSON.stringify(updateResult));
+          } catch (updateErr) {
+            const updateErrMsg = updateErr?.response?.data?.message || updateErr?.response?.data?.errors || updateErr.message || '';
+            const updateErrStr = typeof updateErrMsg === 'string' ? updateErrMsg : JSON.stringify(updateErrMsg);
+            logger.error(`[Shiprocket] updatePickupLocation also failed for seller ${user._id}:`, updateErrStr);
+            // Still set the location name since the location exists on Shiprocket
+            user.sellerProfile.shiprocketPickupLocation = locationName;
+            shiprocketPickupStatus = 'exists_update_failed';
+            shiprocketError = `Address exists on Shiprocket but update failed: ${updateErrStr}`;
           }
+        } else {
+          logger.error('[Shiprocket] Failed to register pickup (non-duplicate error):', errStr);
+          shiprocketPickupStatus = 'failed';
+          shiprocketError = `Shiprocket registration failed: ${errStr}`;
         }
+      }
 
-        // Check pickup phone verification status from Shiprocket
-        try {
-          const locations = await shiprocket.getPickupLocations();
-          const thisLocation = locations.find(l => l.pickup_location === locationName);
-          if (thisLocation) {
-            const isVerified = thisLocation.phone_verified === 1;
-            user.sellerProfile.shiprocketPickupVerified = isVerified;
-            logger.info(`[Shiprocket] Pickup "${locationName}" phone_verified=${thisLocation.phone_verified} (${isVerified ? 'verified' : 'unverified'})`);
-          }
-        } catch (verifyErr) {
-          logger.warn('[Shiprocket] Could not check pickup verification status:', verifyErr.message);
+      // Check pickup phone verification status from Shiprocket
+      try {
+        const locations = await shiprocket.getPickupLocations();
+        const thisLocation = locations.find(l => l.pickup_location === locationName);
+        if (thisLocation) {
+          const isVerified = thisLocation.phone_verified === 1;
+          user.sellerProfile.shiprocketPickupVerified = isVerified;
+          logger.info(`[Shiprocket] Pickup "${locationName}" phone_verified=${thisLocation.phone_verified} (${isVerified ? 'verified' : 'unverified'})`);
         }
+      } catch (verifyErr) {
+        logger.warn('[Shiprocket] Could not check pickup verification status:', verifyErr.message);
       }
     }
 
     await user.save();
     invalidateCache('/api/store/');
-    res.json({ message: 'Settings updated', shiprocketPickupStatus, shiprocketPickupVerified: user.sellerProfile.shiprocketPickupVerified || false });
+    const response = {
+      message: 'Settings updated',
+      shiprocketPickupStatus,
+      shiprocketPickupVerified: user.sellerProfile.shiprocketPickupVerified || false
+    };
+    if (shiprocketError) response.shiprocketError = shiprocketError;
+    res.json(response);
   } catch (err) {
     logger.error('Settings update error:', err.message);
     res.status(500).json({ message: 'Server error' });
