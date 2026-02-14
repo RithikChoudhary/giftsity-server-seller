@@ -61,17 +61,48 @@ router.get('/dashboard', async (req, res) => {
     const totalProducts = await Product.countDocuments({ sellerId });
     const activeProducts = await Product.countDocuments({ sellerId, isActive: true });
 
+    // Pending payout earnings (delivered but not yet in a payout)
     const pendingPayoutAgg = await Order.aggregate([
       { $match: { sellerId: req.user._id, paymentStatus: 'paid', status: 'delivered', payoutStatus: 'pending' } },
-      { $group: { _id: null, total: { $sum: '$sellerAmount' }, count: { $sum: 1 } } }
+      { $group: { _id: null, total: { $sum: '$sellerAmount' }, count: { $sum: 1 },
+        totalSales: { $sum: { $ifNull: ['$itemTotal', '$totalAmount'] } },
+        commissionDeducted: { $sum: { $ifNull: ['$commissionAmount', 0] } },
+        gatewayFees: { $sum: { $ifNull: ['$paymentGatewayFee', 0] } },
+        shippingDeducted: { $sum: { $cond: [{ $eq: ['$shippingPaidBy', 'seller'] }, { $ifNull: ['$shippingCost', 0] }, 0] } }
+      }}
     ]);
-    const pendingPayout = pendingPayoutAgg[0] || { total: 0, count: 0 };
+    const pendingPayout = pendingPayoutAgg[0] || { total: 0, count: 0, totalSales: 0, commissionDeducted: 0, gatewayFees: 0, shippingDeducted: 0 };
+
+    // Lifetime earnings from paid payouts
+    const SellerPayout = require('../../server/models/SellerPayout');
+    const lifetimeAgg = await SellerPayout.aggregate([
+      { $match: { sellerId: req.user._id, status: 'paid' } },
+      { $group: { _id: null, total: { $sum: '$netPayout' } } }
+    ]);
+    const lifetimeEarnings = lifetimeAgg[0]?.total || 0;
+
+    // Next payout date
+    const schedule = settings.payoutSchedule || 'biweekly';
+    const now = new Date();
+    let nextPayoutDate;
+    if (schedule === 'weekly') {
+      nextPayoutDate = new Date(now);
+      nextPayoutDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7)); // Next Monday
+    } else if (schedule === 'biweekly') {
+      const day = now.getDate();
+      if (day < 15) { nextPayoutDate = new Date(now.getFullYear(), now.getMonth(), 15); }
+      else { nextPayoutDate = new Date(now.getFullYear(), now.getMonth() + 1, 1); }
+    } else {
+      nextPayoutDate = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    }
 
     const recentOrders = await Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items');
 
     // Get fresh user data for metrics
     const freshUser = await Seller.findById(sellerId);
     const metrics = freshUser?.sellerProfile?.metrics || {};
+    const bank = freshUser?.sellerProfile?.bankDetails;
+    const bankDetailsComplete = !!(bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName);
 
     res.json({
       stats: {
@@ -84,9 +115,18 @@ router.get('/dashboard', async (req, res) => {
         activeProducts
       },
       currentPeriodEarnings: {
-        pendingAmount: pendingPayout.total,
+        totalSales: pendingPayout.totalSales,
+        commissionDeducted: pendingPayout.commissionDeducted,
+        gatewayFees: pendingPayout.gatewayFees,
+        shippingDeducted: pendingPayout.shippingDeducted,
+        netEarning: Math.max(0, pendingPayout.total - pendingPayout.shippingDeducted),
+        pendingAmount: Math.max(0, pendingPayout.total - pendingPayout.shippingDeducted),
         pendingOrderCount: pendingPayout.count
       },
+      lifetimeEarnings,
+      nextPayoutDate: nextPayoutDate.toISOString(),
+      payoutSchedule: schedule,
+      bankDetailsComplete,
       yourCommissionRate: commissionRate,
       healthMetrics: {
         healthScore: metrics.healthScore ?? null,
@@ -643,7 +683,44 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     if (businessName) user.sellerProfile.businessName = businessName;
     if (businessAddress) user.sellerProfile.businessAddress = businessAddress;
     if (pickupAddress) user.sellerProfile.pickupAddress = pickupAddress;
-    if (bankDetails) user.sellerProfile.bankDetails = bankDetails;
+    if (bankDetails) {
+      // Validate bank details
+      if (bankDetails.ifscCode) {
+        const ifscRegex = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+        if (!ifscRegex.test(bankDetails.ifscCode.toUpperCase())) {
+          return res.status(400).json({ message: 'Invalid IFSC code. Must be 11 characters (e.g., SBIN0001234).' });
+        }
+        bankDetails.ifscCode = bankDetails.ifscCode.toUpperCase();
+      }
+      if (bankDetails.accountNumber) {
+        const acctClean = bankDetails.accountNumber.replace(/\s/g, '');
+        if (!/^\d{9,18}$/.test(acctClean)) {
+          return res.status(400).json({ message: 'Invalid account number. Must be 9-18 digits.' });
+        }
+        bankDetails.accountNumber = acctClean;
+      }
+      user.sellerProfile.bankDetails = bankDetails;
+
+      // Auto-unhold payouts when bank details are added/fixed
+      const isBankComplete = bankDetails.accountHolderName && bankDetails.accountNumber && bankDetails.ifscCode && bankDetails.bankName;
+      if (isBankComplete) {
+        try {
+          const SellerPayout = require('../../server/models/SellerPayout');
+          const onHoldPayouts = await SellerPayout.find({ sellerId: user._id, status: 'on_hold', holdReason: 'missing_bank_details' });
+          for (const payout of onHoldPayouts) {
+            payout.status = 'pending';
+            payout.holdReason = '';
+            payout.bankDetailsSnapshot = bankDetails;
+            await payout.save();
+          }
+          if (onHoldPayouts.length > 0) {
+            logger.info(`[Payout] Auto-unhold ${onHoldPayouts.length} payouts for seller ${user._id} after bank details update`);
+          }
+        } catch (payoutErr) {
+          logger.warn('[Payout] Failed to auto-unhold payouts:', payoutErr.message);
+        }
+      }
+    }
     if (bio !== undefined) user.sellerProfile.bio = bio;
     if (phone) user.phone = phone;
     if (businessType !== undefined) user.sellerProfile.businessType = businessType;
