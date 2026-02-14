@@ -29,7 +29,7 @@ app.use(helmet({
 
 // Compression
 app.use(compression());
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Request logging
 app.use((req, res, next) => {

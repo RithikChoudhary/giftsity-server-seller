@@ -17,7 +17,7 @@ const logger = require('../../server/utils/logger');
 const { invalidateCache } = require('../../server/middleware/cache');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB for video support
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } }); // 30MB max per file
 
 // Rate limiters for seller product endpoints
 const productCreationLimiter = rateLimit({
@@ -165,7 +165,7 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
 
     // Also handle base64 strings sent in body (backward compat)
     const MAX_BASE64_IMAGE_SIZE = 10 * 1024 * 1024; // ~7.5MB decoded
-    const MAX_BASE64_VIDEO_SIZE = 100 * 1024 * 1024; // ~75MB decoded
+    const MAX_BASE64_VIDEO_SIZE = 40 * 1024 * 1024; // ~30MB decoded (base64 is ~33% larger)
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
@@ -186,7 +186,7 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
           if (vid.length > MAX_BASE64_VIDEO_SIZE) {
-            return res.status(400).json({ message: 'Base64 video too large (max ~75MB)' });
+            return res.status(400).json({ message: 'Video too large (max 30MB)' });
           }
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
@@ -310,8 +310,8 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     if (data.newVideos && Array.isArray(data.newVideos)) {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
-          if (vid.length > 100 * 1024 * 1024) {
-            return res.status(400).json({ message: 'Base64 video too large (max ~75MB)' });
+          if (vid.length > 40 * 1024 * 1024) {
+            return res.status(400).json({ message: 'Video too large (max 30MB)' });
           }
           const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
           newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
