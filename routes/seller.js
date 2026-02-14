@@ -1026,13 +1026,30 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
     const shipment = await Shipment.findOne({ orderId: req.params.orderId, sellerId: req.user._id });
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
 
-    const result = await shiprocket.schedulePickup({ shipmentId: shipment.shiprocketShipmentId });
+    try {
+      const result = await shiprocket.schedulePickup({ shipmentId: shipment.shiprocketShipmentId });
+      logger.info(`[Pickup] Scheduled for shipment ${shipment.shiprocketShipmentId}:`, JSON.stringify(result));
+    } catch (pickupErr) {
+      const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data || pickupErr.message || '';
+      const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
+      logger.warn(`[Pickup] Shiprocket schedulePickup error: ${errStr}`);
 
+      // If pickup was already scheduled (auto-scheduled by Shiprocket), treat as success
+      if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('scheduled') || errStr.toLowerCase().includes('pickup')) {
+        logger.info(`[Pickup] Pickup appears already scheduled, syncing local state`);
+      } else {
+        // Genuine error -- pass through to seller
+        return res.status(500).json({ message: errStr || 'Failed to schedule pickup' });
+      }
+    }
+
+    // Update local shipment status
     shipment.status = 'pickup_scheduled';
-    shipment.pickupScheduledAt = new Date();
+    shipment.pickupScheduledAt = shipment.pickupScheduledAt || new Date();
     shipment.statusHistory.push({ status: 'pickup_scheduled', description: 'Pickup scheduled' });
     await shipment.save();
 
+    // Update order to shipped
     const order = await Order.findById(req.params.orderId);
     if (order) {
       const { isValidTransition } = require('../../server/utils/orderStatus');
@@ -1045,7 +1062,8 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
 
     res.json({ message: 'Pickup scheduled', shipment });
   } catch (err) {
-    res.status(500).json({ message: 'Failed to schedule pickup' });
+    logger.error('[Pickup] Unexpected error:', err.message);
+    res.status(500).json({ message: err.message || 'Failed to schedule pickup' });
   }
 });
 
