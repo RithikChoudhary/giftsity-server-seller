@@ -128,6 +128,7 @@ router.get('/dashboard', async (req, res) => {
       payoutSchedule: schedule,
       bankDetailsComplete,
       yourCommissionRate: commissionRate,
+      minimumProductPrice: settings.minimumProductPrice || 200,
       healthMetrics: {
         healthScore: metrics.healthScore ?? null,
         fulfillmentRate: metrics.fulfillmentRate ?? null,
@@ -243,6 +244,12 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
     if (data.price) data.price = Number(data.price);
     if (data.stock) data.stock = Number(data.stock);
     if (data.weight) data.weight = Number(data.weight);
+
+    // Validate minimum product price from platform settings
+    const platformSettings = await PlatformSettings.getSettings();
+    if (data.price < (platformSettings.minimumProductPrice || 0)) {
+      return res.status(400).json({ message: `Minimum product price is Rs. ${platformSettings.minimumProductPrice}` });
+    }
 
     // Parse customization fields from FormData
     data.isCustomizable = data.isCustomizable === 'true' || data.isCustomizable === true;
@@ -402,6 +409,14 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     if (data.stock) data.stock = Number(data.stock);
     if (data.weight) data.weight = Number(data.weight);
 
+    // Validate minimum product price from platform settings
+    if (data.price) {
+      const platformSettings = await PlatformSettings.getSettings();
+      if (data.price < (platformSettings.minimumProductPrice || 0)) {
+        return res.status(400).json({ message: `Minimum product price is Rs. ${platformSettings.minimumProductPrice}` });
+      }
+    }
+
     // Parse customization fields from FormData
     if (data.isCustomizable !== undefined) {
       data.isCustomizable = data.isCustomizable === 'true' || data.isCustomizable === true;
@@ -486,6 +501,8 @@ router.post('/products/bulk-csv', csvUploadLimiter, csvUpload.single('csv'), asy
     }
 
     const results = { success: 0, failed: 0, errors: [] };
+    const csvSettings = await PlatformSettings.getSettings();
+    const csvMinPrice = csvSettings.minimumProductPrice || 0;
     const Category = require('../../server/models/Category');
     const categories = await Category.find().lean();
     const catMap = {};
@@ -514,6 +531,7 @@ router.post('/products/bulk-csv', csvUploadLimiter, csvUpload.single('csv'), asy
         if (!row.title) { results.errors.push({ row: i + 1, error: 'Title is required' }); results.failed++; continue; }
         const price = parseFloat(row.price);
         if (isNaN(price) || price <= 0) { results.errors.push({ row: i + 1, error: 'Invalid price' }); results.failed++; continue; }
+        if (price < csvMinPrice) { results.errors.push({ row: i + 1, error: `Price must be at least Rs. ${csvMinPrice}` }); results.failed++; continue; }
         const stock = parseInt(row.stock);
         if (isNaN(stock) || stock < 0) { results.errors.push({ row: i + 1, error: 'Invalid stock' }); results.failed++; continue; }
 
