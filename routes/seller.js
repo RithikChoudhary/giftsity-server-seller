@@ -932,7 +932,7 @@ router.post('/shipping/serviceability', async (req, res) => {
     const result = await shiprocket.checkServiceability({ pickupPincode, deliveryPincode, weight: 500, cod: 0 });
 
     const companies = result?.data?.available_courier_companies || result?.available_courier_companies || [];
-    const couriers = companies.map(c => ({
+    let couriers = companies.map(c => ({
       courierId: c.courier_company_id,
       courierName: c.courier_name,
       rate: c.rate,
@@ -941,8 +941,15 @@ router.post('/shipping/serviceability', async (req, res) => {
       rating: c.rating
     }));
 
+    // Cap courier selection: when customer paid for shipping, only show couriers within budget
+    const shippingBudget = order.shippingPaidBy === 'customer' ? (order.actualShippingCost || order.shippingCost || 0) : null;
+    if (shippingBudget && shippingBudget > 0) {
+      couriers = couriers.filter(c => c.rate <= shippingBudget);
+      logger.info(`[Shipping] Filtered to ${couriers.length} couriers within budget Rs. ${shippingBudget}`);
+    }
+
     logger.info('[Shipping] Returning', couriers.length, 'couriers');
-    res.json({ couriers, pickupPincode, deliveryPincode });
+    res.json({ couriers, pickupPincode, deliveryPincode, shippingBudget });
   } catch (err) {
     logger.error('Serviceability error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to check serviceability', error: err?.response?.data?.message || err.message });
