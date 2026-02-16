@@ -104,6 +104,8 @@ router.get('/dashboard', async (req, res) => {
     const metrics = freshUser?.sellerProfile?.metrics || {};
     const bank = freshUser?.sellerProfile?.bankDetails;
     const bankDetailsComplete = !!(bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName);
+    const pickupAddr = freshUser?.sellerProfile?.pickupAddress;
+    const pickupAddressComplete = !!(pickupAddr?.street && pickupAddr?.city && pickupAddr?.pincode);
 
     res.json({
       stats: {
@@ -128,6 +130,7 @@ router.get('/dashboard', async (req, res) => {
       nextPayoutDate: nextPayoutDate.toISOString(),
       payoutSchedule: schedule,
       bankDetailsComplete,
+      pickupAddressComplete,
       yourCommissionRate: commissionRate,
       minimumProductPrice: settings.minimumProductPrice || 200,
       healthMetrics: {
@@ -166,6 +169,16 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
       return res.status(400).json({
         message: 'Please add your bank account details in Settings before creating products.',
         code: 'BANK_DETAILS_REQUIRED'
+      });
+    }
+
+    // Require pickup address for Shiprocket shipping
+    const pickup = req.user.sellerProfile?.pickupAddress;
+    const hasPickupAddress = pickup?.street && pickup?.city && pickup?.pincode;
+    if (!hasPickupAddress) {
+      return res.status(400).json({
+        message: 'Please add your pickup address in Settings before creating products. This is required for shipping.',
+        code: 'PICKUP_ADDRESS_REQUIRED'
       });
     }
 
