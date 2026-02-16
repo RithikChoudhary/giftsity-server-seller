@@ -68,5 +68,8 @@ process.on('unhandledRejection', (err) => {
 
 // Start
 connectDB().then(() => {
-  app.listen(PORT, () => logger.info(`Giftsity Seller server running on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`[Startup] Giftsity Seller server running on port ${PORT}`);
+    logger.info(`Giftsity Seller server running on port ${PORT}`);
+  });
 });

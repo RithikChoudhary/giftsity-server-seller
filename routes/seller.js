@@ -13,6 +13,7 @@ const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
 const { sanitizeBody } = require('../../server/middleware/sanitize');
 const { logActivity } = require('../../server/utils/audit');
+const { createNotification } = require('../../server/utils/notify');
 const logger = require('../../server/utils/logger');
 const { invalidateCache } = require('../../server/middleware/cache');
 const rateLimit = require('express-rate-limit');
@@ -610,6 +611,8 @@ router.put('/orders/:id/status', async (req, res) => {
         if (order.customerEmail) await sendDeliveredEmail(order.customerEmail, order);
       } catch (e) { logger.error('Delivered email error:', e.message); }
     }
+    if (!order.statusHistory) order.statusHistory = [];
+    order.statusHistory.push({ status, timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: `Marked ${status} by seller` });
     await order.save();
 
     // Send corporate order status email for B2B orders
@@ -618,6 +621,18 @@ router.put('/orders/:id/status', async (req, res) => {
         const { sendCorporateOrderStatusEmail } = require('../../server/utils/email');
         if (order.customerEmail) await sendCorporateOrderStatusEmail(order.customerEmail, order, status);
       } catch (e) { logger.error('Corporate status email error:', e.message); }
+    }
+
+    // Notify customer about status change
+    const statusNotifTypes = { delivered: 'order_delivered', shipped: 'order_shipped', cancelled: 'order_cancelled' };
+    if (statusNotifTypes[status] && order.customerId) {
+      createNotification({
+        userId: order.customerId.toString(), userRole: 'customer',
+        type: statusNotifTypes[status],
+        title: `Order #${order.orderNumber} ${status}`,
+        message: status === 'delivered' ? 'Your order has been delivered!' : status === 'cancelled' ? 'Your order has been cancelled' : `Your order has been ${status}`,
+        link: `/orders/${order._id}`, metadata: { orderId: order._id.toString() }
+      });
     }
 
     logActivity({ domain: 'seller', action: `order_${status}`, actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} marked as ${status}` });
@@ -645,6 +660,8 @@ router.put('/orders/:id/ship', async (req, res) => {
       shippedAt: new Date(),
       estimatedDelivery: estimatedDelivery ? new Date(estimatedDelivery) : null
     };
+    if (!order.statusHistory) order.statusHistory = [];
+    order.statusHistory.push({ status: 'shipped', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: `Shipped via ${courierName || 'courier'}` });
     await order.save();
 
     // Send shipped email
@@ -662,6 +679,14 @@ router.put('/orders/:id/ship', async (req, res) => {
     }
 
     logActivity({ domain: 'seller', action: 'order_shipped', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Order', targetId: order._id, message: `Order ${order.orderNumber} shipped via ${courierName || 'unknown'}`, metadata: { courierName, trackingNumber } });
+
+    createNotification({
+      userId: order.customerId.toString(), userRole: 'customer',
+      type: 'order_shipped', title: `Order #${order.orderNumber} shipped`,
+      message: `Your order has been shipped${trackingNumber ? ` (Tracking: ${trackingNumber})` : ''}`,
+      link: `/orders/${order._id}`, metadata: { orderId: order._id.toString() }
+    });
+
     res.json({ order, message: 'Order marked as shipped' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -1158,7 +1183,16 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
       if (isValidTransition(order.status, 'shipped')) {
         order.status = 'shipped';
         order.trackingInfo = { courierName: shipment.courierName, trackingNumber: shipment.awbCode, shippedAt: new Date() };
+        if (!order.statusHistory) order.statusHistory = [];
+        order.statusHistory.push({ status: 'shipped', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: `Shipped via ${shipment.courierName}` });
         await order.save();
+
+        createNotification({
+          userId: order.customerId.toString(), userRole: 'customer',
+          type: 'order_shipped', title: `Order #${order.orderNumber} shipped`,
+          message: `Your order has been shipped via ${shipment.courierName}`,
+          link: `/orders/${order._id}`, metadata: { orderId: order._id.toString() }
+        });
       }
     }
 
@@ -1254,6 +1288,207 @@ router.post('/request-unsuspend', async (req, res) => {
     res.json({ message: 'Suspension removal request submitted. Admin will review.' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ==================== RETURNS ====================
+const ReturnRequest = require('../../server/models/ReturnRequest');
+
+// GET /api/seller/returns -- list return requests for seller's orders
+router.get('/returns', async (req, res) => {
+  try {
+    const filter = { sellerId: req.user._id };
+    if (req.query.status) filter.status = req.query.status;
+    const requests = await ReturnRequest.find(filter)
+      .sort({ createdAt: -1 })
+      .populate('orderId', 'orderNumber totalAmount')
+      .populate('customerId', 'name email phone')
+      .lean();
+    res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/seller/returns/:id/approve
+router.put('/returns/:id/approve', async (req, res) => {
+  try {
+    const returnReq = await ReturnRequest.findById(req.params.id);
+    if (!returnReq) return res.status(404).json({ message: 'Return request not found' });
+    if (returnReq.sellerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your return request' });
+    }
+    if (returnReq.status !== 'requested') {
+      return res.status(400).json({ message: 'Can only approve requested returns' });
+    }
+
+    returnReq.status = 'approved';
+    returnReq.statusHistory.push({
+      status: 'approved', timestamp: new Date(),
+      changedBy: req.user._id, changedByRole: 'seller',
+      note: req.body.note || 'Approved by seller'
+    });
+    await returnReq.save();
+
+    // Update order
+    await Order.findByIdAndUpdate(returnReq.orderId, {
+      returnStatus: 'approved',
+      $push: { statusHistory: { status: 'return_approved', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: 'Return approved' } }
+    });
+
+    createNotification({
+      userId: returnReq.customerId.toString(),
+      userRole: 'customer',
+      type: 'return_approved',
+      title: 'Return request approved',
+      message: 'Your return request has been approved. Please ship the item back.',
+      link: `/returns/${returnReq._id}`,
+      metadata: { returnRequestId: returnReq._id.toString() }
+    });
+
+    logActivity({ domain: 'order', action: 'return_approved', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'ReturnRequest', targetId: returnReq._id, message: 'Return approved by seller' });
+
+    res.json({ message: 'Return approved', returnRequest: returnReq });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/seller/returns/:id/reject
+router.put('/returns/:id/reject', async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) return res.status(400).json({ message: 'Rejection reason required' });
+
+    const returnReq = await ReturnRequest.findById(req.params.id);
+    if (!returnReq) return res.status(404).json({ message: 'Return request not found' });
+    if (returnReq.sellerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your return request' });
+    }
+    if (returnReq.status !== 'requested') {
+      return res.status(400).json({ message: 'Can only reject requested returns' });
+    }
+
+    returnReq.status = 'rejected';
+    returnReq.rejectionReason = reason;
+    returnReq.resolvedAt = new Date();
+    returnReq.statusHistory.push({
+      status: 'rejected', timestamp: new Date(),
+      changedBy: req.user._id, changedByRole: 'seller',
+      note: reason
+    });
+    await returnReq.save();
+
+    await Order.findByIdAndUpdate(returnReq.orderId, {
+      returnStatus: 'rejected',
+      $push: { statusHistory: { status: 'return_rejected', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: reason } }
+    });
+
+    createNotification({
+      userId: returnReq.customerId.toString(),
+      userRole: 'customer',
+      type: 'return_rejected',
+      title: 'Return request rejected',
+      message: `Reason: ${reason}`,
+      link: `/returns/${returnReq._id}`,
+      metadata: { returnRequestId: returnReq._id.toString() }
+    });
+
+    logActivity({ domain: 'order', action: 'return_rejected', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'ReturnRequest', targetId: returnReq._id, message: `Return rejected: ${reason}` });
+
+    res.json({ message: 'Return rejected', returnRequest: returnReq });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/seller/returns/:id/received -- mark item received, trigger refund
+router.put('/returns/:id/received', async (req, res) => {
+  try {
+    const returnReq = await ReturnRequest.findById(req.params.id);
+    if (!returnReq) return res.status(404).json({ message: 'Return request not found' });
+    if (returnReq.sellerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your return request' });
+    }
+    if (!['approved', 'shipped_back'].includes(returnReq.status)) {
+      return res.status(400).json({ message: 'Item must be approved or shipped back first' });
+    }
+
+    const order = await Order.findById(returnReq.orderId);
+
+    returnReq.status = 'received';
+    returnReq.statusHistory.push({
+      status: 'received', timestamp: new Date(),
+      changedBy: req.user._id, changedByRole: 'seller',
+      note: 'Item received by seller'
+    });
+
+    // If return type, initiate refund
+    if (returnReq.type === 'return' && order && order.cashfreeOrderId && returnReq.refundAmount > 0) {
+      try {
+        const refundId = `return_${order.orderNumber}_${Date.now()}`;
+        await require('../../server/config/cashfree').createRefund({
+          orderId: order.cashfreeOrderId,
+          refundAmount: returnReq.refundAmount,
+          refundId,
+          refundNote: `Return refund for order ${order.orderNumber}`
+        });
+        returnReq.refundId = refundId;
+        returnReq.status = 'refunded';
+        returnReq.statusHistory.push({
+          status: 'refunded', timestamp: new Date(),
+          changedBy: req.user._id, changedByRole: 'seller',
+          note: `Refund initiated: ${refundId}`
+        });
+        if (order) {
+          order.returnStatus = 'completed';
+          order.paymentStatus = 'refund_pending';
+          order.refundId = refundId;
+          order.statusHistory = order.statusHistory || [];
+          order.statusHistory.push({ status: 'return_refunded', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: `Refund: Rs.${returnReq.refundAmount}` });
+          await order.save();
+        }
+      } catch (refundErr) {
+        // Refund failed but item was received
+        returnReq.statusHistory.push({
+          status: 'received', timestamp: new Date(),
+          changedByRole: 'system',
+          note: `Refund failed: ${refundErr.message}`
+        });
+      }
+    } else if (returnReq.type === 'exchange') {
+      returnReq.status = 'exchanged';
+      returnReq.statusHistory.push({
+        status: 'exchanged', timestamp: new Date(),
+        changedBy: req.user._id, changedByRole: 'seller',
+        note: 'Exchange item received, replacement will be shipped'
+      });
+      if (order) {
+        order.returnStatus = 'completed';
+        order.statusHistory = order.statusHistory || [];
+        order.statusHistory.push({ status: 'exchange_completed', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: 'Exchange processed' });
+        await order.save();
+      }
+    }
+
+    returnReq.resolvedAt = new Date();
+    await returnReq.save();
+
+    createNotification({
+      userId: returnReq.customerId.toString(),
+      userRole: 'customer',
+      type: 'return_refunded',
+      title: returnReq.type === 'return' ? 'Refund initiated' : 'Exchange processed',
+      message: returnReq.type === 'return' ? `Rs.${returnReq.refundAmount} refund initiated` : 'Your exchange has been processed',
+      link: `/returns/${returnReq._id}`,
+      metadata: { returnRequestId: returnReq._id.toString() }
+    });
+
+    logActivity({ domain: 'order', action: 'return_received', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'ReturnRequest', targetId: returnReq._id, message: `Return item received, ${returnReq.type === 'return' ? 'refund initiated' : 'exchange processed'}` });
+
+    res.json({ message: 'Item received and processed', returnRequest: returnReq });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
