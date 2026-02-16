@@ -16,6 +16,7 @@ const { logActivity } = require('../../server/utils/audit');
 const { createNotification } = require('../../server/utils/notify');
 const logger = require('../../server/utils/logger');
 const { invalidateCache } = require('../../server/middleware/cache');
+const { submitToIndexNow } = require('../../server/utils/indexnow');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } }); // 30MB max per file
@@ -211,16 +212,20 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
         }
       }
 
-      for (const file of req.files) {
+      // Upload all files in parallel for speed
+      const uploadPromises = req.files.map(file => {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
         const isVideo = file.mimetype.startsWith('video/');
-
-        if (isVideo) {
-          const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+        return isVideo
+          ? uploadVideo(base64, { folder: `${sellerFolder}/videos` }).then(r => ({ ...r, _isVideo: true }))
+          : uploadImage(base64, { folder: sellerFolder }).then(r => ({ ...r, _isVideo: false }));
+      });
+      const results = await Promise.all(uploadPromises);
+      for (const result of results) {
+        if (result._isVideo) {
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         } else {
-          const result = await uploadImage(base64, { folder: sellerFolder });
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId, width: result.width || 0, height: result.height || 0 });
@@ -231,34 +236,53 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
     // Also handle base64 strings sent in body (backward compat)
     const MAX_BASE64_IMAGE_SIZE = 10 * 1024 * 1024; // ~7.5MB decoded
     const MAX_BASE64_VIDEO_SIZE = 40 * 1024 * 1024; // ~30MB decoded (base64 is ~33% larger)
+
+    // Validate sizes before uploading
+    if (data.newImages && Array.isArray(data.newImages)) {
+      for (const img of data.newImages) {
+        if (typeof img === 'string' && img.startsWith('data:') && img.length > MAX_BASE64_IMAGE_SIZE) {
+          return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
+        }
+      }
+    }
+    if (data.newVideos && Array.isArray(data.newVideos)) {
+      for (const vid of data.newVideos) {
+        if (typeof vid === 'string' && vid.startsWith('data:') && vid.length > MAX_BASE64_VIDEO_SIZE) {
+          return res.status(400).json({ message: 'Video too large (max 30MB)' });
+        }
+      }
+    }
+
+    // Upload base64 images and videos in parallel
+    const base64Promises = [];
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
-          if (img.length > MAX_BASE64_IMAGE_SIZE) {
-            return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
-          }
-          const result = await uploadImage(img, { folder: sellerFolder });
+          base64Promises.push(uploadImage(img, { folder: sellerFolder }).then(r => ({ ...r, _isVideo: false })));
+        }
+      }
+      delete data.newImages;
+    }
+    if (data.newVideos && Array.isArray(data.newVideos)) {
+      for (const vid of data.newVideos) {
+        if (typeof vid === 'string' && vid.startsWith('data:')) {
+          base64Promises.push(uploadVideo(vid, { folder: `${sellerFolder}/videos` }).then(r => ({ ...r, _isVideo: true })));
+        }
+      }
+      delete data.newVideos;
+    }
+    if (base64Promises.length > 0) {
+      const base64Results = await Promise.all(base64Promises);
+      for (const result of base64Results) {
+        if (result._isVideo) {
+          allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        } else {
           allUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
         }
       }
-      delete data.newImages;
-    }
-
-    // Handle base64 video strings in body
-    if (data.newVideos && Array.isArray(data.newVideos)) {
-      for (const vid of data.newVideos) {
-        if (typeof vid === 'string' && vid.startsWith('data:')) {
-          if (vid.length > MAX_BASE64_VIDEO_SIZE) {
-            return res.status(400).json({ message: 'Video too large (max 30MB)' });
-          }
-          const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
-          allUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
-          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
-        }
-      }
-      delete data.newVideos;
     }
 
     if (uploadedImages.length > 0) data.images = uploadedImages;
@@ -287,6 +311,7 @@ router.post('/products', productCreationLimiter, upload.array('media', 15), sani
     invalidateCache('/api/products');
     invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_created', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" created` });
+    submitToIndexNow(`https://giftsity.com/product/${product.slug}`);
     res.status(201).json({ product, message: 'Product created' });
   } catch (err) {
     // Cleanup orphaned uploads if product save failed
@@ -344,16 +369,20 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
         }
       }
 
-      for (const file of req.files) {
+      // Upload all files in parallel for speed
+      const uploadPromises = req.files.map(file => {
         const base64 = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
         const isVideo = file.mimetype.startsWith('video/');
-
-        if (isVideo) {
-          const result = await uploadVideo(base64, { folder: `${sellerFolder}/videos` });
+        return isVideo
+          ? uploadVideo(base64, { folder: `${sellerFolder}/videos` }).then(r => ({ ...r, _isVideo: true }))
+          : uploadImage(base64, { folder: sellerFolder }).then(r => ({ ...r, _isVideo: false }));
+      });
+      const results = await Promise.all(uploadPromises);
+      for (const result of results) {
+        if (result._isVideo) {
           newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
           uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
         } else {
-          const result = await uploadImage(base64, { folder: sellerFolder });
           newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
           uploadedImages.push(result);
           uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
@@ -361,35 +390,52 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
       }
     }
 
-    // Also handle base64 image strings in body (backward compat)
+    // Validate base64 sizes before uploading
+    if (data.newImages && Array.isArray(data.newImages)) {
+      for (const img of data.newImages) {
+        if (typeof img === 'string' && img.startsWith('data:') && img.length > 10 * 1024 * 1024) {
+          return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
+        }
+      }
+    }
+    if (data.newVideos && Array.isArray(data.newVideos)) {
+      for (const vid of data.newVideos) {
+        if (typeof vid === 'string' && vid.startsWith('data:') && vid.length > 40 * 1024 * 1024) {
+          return res.status(400).json({ message: 'Video too large (max 30MB)' });
+        }
+      }
+    }
+
+    // Upload base64 images and videos in parallel
+    const base64Promises = [];
     if (data.newImages && Array.isArray(data.newImages)) {
       for (const img of data.newImages) {
         if (typeof img === 'string' && img.startsWith('data:')) {
-          if (img.length > 10 * 1024 * 1024) {
-            return res.status(400).json({ message: 'Base64 image too large (max ~7.5MB)' });
-          }
-          const result = await uploadImage(img, { folder: sellerFolder });
-          newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
-          uploadedImages.push(result);
-          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
+          base64Promises.push(uploadImage(img, { folder: sellerFolder }).then(r => ({ ...r, _isVideo: false })));
         }
       }
       delete data.newImages;
     }
-
-    // Handle base64 video strings in body
     if (data.newVideos && Array.isArray(data.newVideos)) {
       for (const vid of data.newVideos) {
         if (typeof vid === 'string' && vid.startsWith('data:')) {
-          if (vid.length > 40 * 1024 * 1024) {
-            return res.status(400).json({ message: 'Video too large (max 30MB)' });
-          }
-          const result = await uploadVideo(vid, { folder: `${sellerFolder}/videos` });
-          newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
-          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+          base64Promises.push(uploadVideo(vid, { folder: `${sellerFolder}/videos` }).then(r => ({ ...r, _isVideo: true })));
         }
       }
       delete data.newVideos;
+    }
+    if (base64Promises.length > 0) {
+      const base64Results = await Promise.all(base64Promises);
+      for (const result of base64Results) {
+        if (result._isVideo) {
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'video' });
+          uploadedMedia.push({ type: 'video', url: result.url, thumbnailUrl: result.thumbnailUrl, publicId: result.publicId, duration: result.duration, width: result.width, height: result.height });
+        } else {
+          newUploadedPublicIds.push({ publicId: result.publicId, type: 'image' });
+          uploadedImages.push(result);
+          uploadedMedia.push({ type: 'image', url: result.url, publicId: result.publicId });
+        }
+      }
     }
 
     // Merge existing + newly uploaded
@@ -455,6 +501,7 @@ router.put('/products/:id', upload.array('media', 15), sanitizeBody, async (req,
     invalidateCache('/api/products');
     invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_updated', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: product._id, message: `Product "${product.title}" updated` });
+    if (product.slug) submitToIndexNow(`https://giftsity.com/product/${product.slug}`);
     res.json({ product, message: 'Product updated' });
   } catch (err) {
     // Cleanup newly uploaded files if save failed
@@ -490,6 +537,7 @@ router.delete('/products/:id', async (req, res) => {
     invalidateCache('/api/products');
     invalidateCache('/api/store/');
     logActivity({ domain: 'seller', action: 'product_deleted', actorRole: 'seller', actorId: req.user._id, actorEmail: req.user.email, targetType: 'Product', targetId: req.params.id, message: `Product deleted` });
+    if (product.slug) submitToIndexNow(`https://giftsity.com/product/${product.slug}`);
     res.json({ message: 'Product deleted' });
   } catch (err) {
     logger.error('Delete product error:', err.message);
@@ -614,13 +662,25 @@ router.get('/orders', async (req, res) => {
   }
 });
 
+// GET single order detail (includes customer shipping address for manual shipment)
+router.get('/orders/:id', async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, sellerId: req.user._id })
+      .populate('customerId', 'name email phone');
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 router.put('/orders/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     const order = await Order.findOne({ _id: req.params.id, sellerId: req.user._id });
     if (!order) return res.status(404).json({ message: 'Order not found' });
 
-    const transitions = { pending: ['confirmed', 'cancelled'], confirmed: ['shipped', 'cancelled'], shipped: ['delivered'], processing: ['shipped', 'cancelled'] };
+    const transitions = { pending: ['confirmed', 'cancelled'], confirmed: ['processing', 'shipped', 'cancelled'], shipped: ['delivered'], processing: ['shipped', 'cancelled'] };
     const allowed = transitions[order.status] || [];
     if (!allowed.includes(status)) return res.status(400).json({ message: `Cannot change from ${order.status} to ${status}` });
 
