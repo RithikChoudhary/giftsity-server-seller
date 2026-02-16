@@ -159,6 +159,16 @@ router.get('/products', async (req, res) => {
 router.post('/products', productCreationLimiter, upload.array('media', 15), sanitizeBody, async (req, res) => {
   const allUploadedPublicIds = []; // Track for cleanup on failure
   try {
+    // Require bank details before allowing product creation
+    const bank = req.user.sellerProfile?.bankDetails;
+    const hasBankDetails = bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName;
+    if (!hasBankDetails) {
+      return res.status(400).json({
+        message: 'Please add your bank account details in Settings before creating products.',
+        code: 'BANK_DETAILS_REQUIRED'
+      });
+    }
+
     const sellerId = req.user._id;
     const data = { ...req.body };
     // Strip fields that sellers must not control
