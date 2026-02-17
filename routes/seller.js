@@ -70,7 +70,7 @@ router.get('/dashboard', async (req, res) => {
         totalSales: { $sum: { $ifNull: ['$itemTotal', '$totalAmount'] } },
         commissionDeducted: { $sum: { $ifNull: ['$commissionAmount', 0] } },
         gatewayFees: { $sum: { $ifNull: ['$paymentGatewayFee', 0] } },
-        shippingDeducted: { $sum: { $cond: [{ $eq: ['$shippingPaidBy', 'seller'] }, { $ifNull: ['$shippingCost', 0] }, 0] } }
+        shippingDeducted: { $sum: { $cond: [{ $eq: ['$shippingPaidBy', 'seller'] }, { $ifNull: ['$actualShippingCost', { $ifNull: ['$shippingCost', 0] }] }, 0] } }
       }}
     ]);
     const pendingPayout = pendingPayoutAgg[0] || { total: 0, count: 0, totalSales: 0, commissionDeducted: 0, gatewayFees: 0, shippingDeducted: 0 };
@@ -1208,7 +1208,7 @@ router.post('/shipping/:orderId/create', async (req, res) => {
 
 router.post('/shipping/:orderId/assign-courier', async (req, res) => {
   try {
-    const { courierId } = req.body;
+    const { courierId, courierRate } = req.body;
     const shipment = await Shipment.findOne({ orderId: req.params.orderId, sellerId: req.user._id });
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
 
@@ -1221,8 +1221,21 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
     shipment.awbCode = result.response?.data?.awb_code || result.awb_code || '';
     shipment.courierName = result.response?.data?.courier_name || result.courier_name || '';
     shipment.courierId = courierId;
+    if (courierRate && courierRate > 0) {
+      shipment.shippingCharge = Math.round(courierRate);
+    }
     shipment.statusHistory.push({ status: 'courier_assigned', description: `Courier: ${shipment.courierName}` });
     await shipment.save();
+
+    // Update order's actualShippingCost with real courier rate (used for payout deduction)
+    if (courierRate && courierRate > 0) {
+      const order = await Order.findById(req.params.orderId);
+      if (order && order.shippingPaidBy === 'seller') {
+        order.actualShippingCost = Math.round(courierRate);
+        await order.save();
+        logger.info(`[Shipping] Updated actualShippingCost to Rs.${Math.round(courierRate)} for order ${order.orderNumber}`);
+      }
+    }
 
     res.json({ message: 'Courier assigned', shipment });
   } catch (err) {
