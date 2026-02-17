@@ -52,35 +52,37 @@ router.get('/dashboard', async (req, res) => {
     const settings = await PlatformSettings.getSettings();
     const commissionRate = getCommissionRate(req.user, settings);
 
-    const totalOrders = await Order.countDocuments({ sellerId, paymentStatus: 'paid' });
-    const totalSalesAgg = await Order.aggregate([
-      { $match: { sellerId: req.user._id, paymentStatus: 'paid' } },
-      { $group: { _id: null, total: { $sum: '$totalAmount' }, commission: { $sum: '$commissionAmount' }, sellerEarnings: { $sum: '$sellerAmount' } } }
+    const SellerPayout = require('../../server/models/SellerPayout');
+
+    // Run all independent queries in parallel
+    const [totalOrders, totalSalesAgg, pendingOrders, totalProducts, activeProducts, pendingPayoutAgg, lifetimeAgg, recentOrders, freshUser] = await Promise.all([
+      Order.countDocuments({ sellerId, paymentStatus: 'paid' }),
+      Order.aggregate([
+        { $match: { sellerId: req.user._id, paymentStatus: 'paid' } },
+        { $group: { _id: null, total: { $sum: '$totalAmount' }, commission: { $sum: '$commissionAmount' }, sellerEarnings: { $sum: '$sellerAmount' } } }
+      ]),
+      Order.countDocuments({ sellerId, status: { $in: ['pending', 'confirmed', 'processing'] } }),
+      Product.countDocuments({ sellerId }),
+      Product.countDocuments({ sellerId, isActive: true }),
+      Order.aggregate([
+        { $match: { sellerId: req.user._id, paymentStatus: 'paid', status: 'delivered', payoutStatus: 'pending' } },
+        { $group: { _id: null, total: { $sum: '$sellerAmount' }, count: { $sum: 1 },
+          totalSales: { $sum: { $ifNull: ['$itemTotal', '$totalAmount'] } },
+          commissionDeducted: { $sum: { $ifNull: ['$commissionAmount', 0] } },
+          gatewayFees: { $sum: { $ifNull: ['$paymentGatewayFee', 0] } },
+          shippingDeducted: { $sum: { $cond: [{ $eq: ['$shippingPaidBy', 'seller'] }, { $ifNull: ['$actualShippingCost', { $ifNull: ['$shippingCost', 0] }] }, 0] } }
+        }}
+      ]),
+      SellerPayout.aggregate([
+        { $match: { sellerId: req.user._id, status: 'paid' } },
+        { $group: { _id: null, total: { $sum: '$netPayout' } } }
+      ]),
+      Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items').lean(),
+      Seller.findById(sellerId).lean()
     ]);
 
     const stats = totalSalesAgg[0] || { total: 0, commission: 0, sellerEarnings: 0 };
-    const pendingOrders = await Order.countDocuments({ sellerId, status: { $in: ['pending', 'confirmed', 'processing'] } });
-    const totalProducts = await Product.countDocuments({ sellerId });
-    const activeProducts = await Product.countDocuments({ sellerId, isActive: true });
-
-    // Pending payout earnings (delivered but not yet in a payout)
-    const pendingPayoutAgg = await Order.aggregate([
-      { $match: { sellerId: req.user._id, paymentStatus: 'paid', status: 'delivered', payoutStatus: 'pending' } },
-      { $group: { _id: null, total: { $sum: '$sellerAmount' }, count: { $sum: 1 },
-        totalSales: { $sum: { $ifNull: ['$itemTotal', '$totalAmount'] } },
-        commissionDeducted: { $sum: { $ifNull: ['$commissionAmount', 0] } },
-        gatewayFees: { $sum: { $ifNull: ['$paymentGatewayFee', 0] } },
-        shippingDeducted: { $sum: { $cond: [{ $eq: ['$shippingPaidBy', 'seller'] }, { $ifNull: ['$actualShippingCost', { $ifNull: ['$shippingCost', 0] }] }, 0] } }
-      }}
-    ]);
     const pendingPayout = pendingPayoutAgg[0] || { total: 0, count: 0, totalSales: 0, commissionDeducted: 0, gatewayFees: 0, shippingDeducted: 0 };
-
-    // Lifetime earnings from paid payouts
-    const SellerPayout = require('../../server/models/SellerPayout');
-    const lifetimeAgg = await SellerPayout.aggregate([
-      { $match: { sellerId: req.user._id, status: 'paid' } },
-      { $group: { _id: null, total: { $sum: '$netPayout' } } }
-    ]);
     const lifetimeEarnings = lifetimeAgg[0]?.total || 0;
 
     // Next payout date
@@ -89,7 +91,7 @@ router.get('/dashboard', async (req, res) => {
     let nextPayoutDate;
     if (schedule === 'weekly') {
       nextPayoutDate = new Date(now);
-      nextPayoutDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7)); // Next Monday
+      nextPayoutDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7));
     } else if (schedule === 'biweekly') {
       const day = now.getDate();
       if (day < 15) { nextPayoutDate = new Date(now.getFullYear(), now.getMonth(), 15); }
@@ -97,11 +99,6 @@ router.get('/dashboard', async (req, res) => {
     } else {
       nextPayoutDate = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     }
-
-    const recentOrders = await Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items');
-
-    // Get fresh user data for metrics
-    const freshUser = await Seller.findById(sellerId);
     const metrics = freshUser?.sellerProfile?.metrics || {};
     const bank = freshUser?.sellerProfile?.bankDetails;
     const bankDetailsComplete = !!(bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName);
@@ -153,7 +150,7 @@ router.get('/dashboard', async (req, res) => {
 // =================== PRODUCTS CRUD ===================
 router.get('/products', async (req, res) => {
   try {
-    const products = await Product.find({ sellerId: req.user._id }).sort({ createdAt: -1 });
+    const products = await Product.find({ sellerId: req.user._id }).sort({ createdAt: -1 }).lean();
     res.json({ products });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -653,7 +650,7 @@ router.get('/orders', async (req, res) => {
     if (status && typeof status === 'string') filter.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    const orders = await Order.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).populate('customerId', 'name email phone');
+    const orders = await Order.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).populate('customerId', 'name email phone').lean();
     const total = await Order.countDocuments(filter);
 
     res.json({ orders, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
@@ -666,7 +663,8 @@ router.get('/orders', async (req, res) => {
 router.get('/orders/:id', async (req, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, sellerId: req.user._id })
-      .populate('customerId', 'name email phone');
+      .populate('customerId', 'name email phone')
+      .lean();
     if (!order) return res.status(404).json({ message: 'Order not found' });
     res.json(order);
   } catch (err) {
