@@ -11,6 +11,7 @@ const { uploadImage, uploadVideo, deleteImage, deleteVideo, deleteMedia } = requ
 const { slugify } = require('../../server/utils/slugify');
 const { getCommissionRate } = require('../../server/utils/commission');
 const shiprocket = require('../../server/config/shiprocket');
+const { createRefund, getCashfreeOrder } = require('../../server/config/cashfree');
 const { sanitizeBody } = require('../../server/middleware/sanitize');
 const { logActivity } = require('../../server/utils/audit');
 const { createNotification } = require('../../server/utils/notify');
@@ -716,6 +717,35 @@ router.put('/orders/:id/status', async (req, res) => {
         shipment.status = 'cancelled';
         shipment.statusHistory.push({ status: 'cancelled', description: 'Cancelled by seller' });
         await shipment.save();
+      }
+
+      // Restore reserved stock
+      for (const item of order.items) {
+        const stockInc = { stock: item.quantity };
+        if (order.paymentStatus === 'paid') stockInc.orderCount = -item.quantity;
+        await Product.findByIdAndUpdate(item.productId, { $inc: stockInc });
+      }
+
+      // Initiate Cashfree refund if payment was completed
+      if (order.paymentStatus === 'paid' && order.cashfreeOrderId) {
+        try {
+          let refundAmount = order.totalAmount;
+          try {
+            const cfOrderData = await getCashfreeOrder(order.cashfreeOrderId);
+            if (cfOrderData.order_amount) {
+              refundAmount = Math.min(order.totalAmount, parseFloat(cfOrderData.order_amount));
+            }
+          } catch (cfErr) {
+            logger.warn(`[Refund] Could not verify Cashfree amount: ${cfErr.message}`);
+          }
+          const refundId = `refund_${order.orderNumber}_${Date.now()}`;
+          await createRefund({ orderId: order.cashfreeOrderId, refundAmount, refundId, refundNote: 'Order cancelled by seller' });
+          order.paymentStatus = 'refunded';
+          order.refundId = refundId;
+        } catch (refundErr) {
+          logger.error(`[Refund] Failed for seller-cancel ${order.orderNumber}:`, refundErr.message);
+          order.paymentStatus = 'refund_pending';
+        }
       }
     }
     if (status === 'delivered') {
