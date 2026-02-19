@@ -45,6 +45,22 @@ router.use(requireAuth, requireSeller);
 const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const ALLOWED_VIDEO_MIMES = ['video/mp4', 'video/webm', 'video/quicktime'];
 
+// =================== PREFLIGHT (lightweight check) ===================
+router.get('/preflight', async (req, res) => {
+  try {
+    const settings = await PlatformSettings.getSettings();
+    const bank = req.user.sellerProfile?.bankDetails;
+    const pickup = req.user.sellerProfile?.pickupAddress;
+    res.json({
+      minimumProductPrice: settings.minimumProductPrice || 200,
+      bankDetailsComplete: !!(bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName),
+      pickupAddressComplete: !!(pickup?.street && pickup?.city && pickup?.pincode)
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // =================== DASHBOARD ===================
 router.get('/dashboard', async (req, res) => {
   try {
@@ -55,7 +71,7 @@ router.get('/dashboard', async (req, res) => {
     const SellerPayout = require('../../server/models/SellerPayout');
 
     // Run all independent queries in parallel
-    const [totalOrders, totalSalesAgg, pendingOrders, totalProducts, activeProducts, pendingPayoutAgg, lifetimeAgg, recentOrders, freshUser] = await Promise.all([
+    const [totalOrders, totalSalesAgg, pendingOrders, totalProducts, activeProducts, pendingPayoutAgg, lifetimeAgg, recentOrders] = await Promise.all([
       Order.countDocuments({ sellerId, paymentStatus: 'paid' }),
       Order.aggregate([
         { $match: { sellerId: req.user._id, paymentStatus: 'paid' } },
@@ -77,8 +93,7 @@ router.get('/dashboard', async (req, res) => {
         { $match: { sellerId: req.user._id, status: 'paid' } },
         { $group: { _id: null, total: { $sum: '$netPayout' } } }
       ]),
-      Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items').lean(),
-      Seller.findById(sellerId).lean()
+      Order.find({ sellerId }).sort({ createdAt: -1 }).limit(10).select('orderNumber status totalAmount sellerAmount createdAt items').lean()
     ]);
 
     const stats = totalSalesAgg[0] || { total: 0, commission: 0, sellerEarnings: 0 };
@@ -99,10 +114,10 @@ router.get('/dashboard', async (req, res) => {
     } else {
       nextPayoutDate = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     }
-    const metrics = freshUser?.sellerProfile?.metrics || {};
-    const bank = freshUser?.sellerProfile?.bankDetails;
+    const metrics = req.user.sellerProfile?.metrics || {};
+    const bank = req.user.sellerProfile?.bankDetails;
     const bankDetailsComplete = !!(bank?.accountHolderName && bank?.accountNumber && bank?.ifscCode && bank?.bankName);
-    const pickupAddr = freshUser?.sellerProfile?.pickupAddress;
+    const pickupAddr = req.user.sellerProfile?.pickupAddress;
     const pickupAddressComplete = !!(pickupAddr?.street && pickupAddr?.city && pickupAddr?.pincode);
 
     res.json({
@@ -777,7 +792,7 @@ router.put('/orders/:id/ship', async (req, res) => {
 // =================== PAYOUTS ===================
 router.get('/payouts', async (req, res) => {
   try {
-    const payouts = await SellerPayout.find({ sellerId: req.user._id }).sort({ createdAt: -1 });
+    const payouts = await SellerPayout.find({ sellerId: req.user._id }).sort({ createdAt: -1 }).lean();
     res.json({ payouts });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -1294,6 +1309,19 @@ router.post('/shipping/:orderId/pickup', async (req, res) => {
   } catch (err) {
     logger.error('[Pickup] Unexpected error:', err.message);
     res.status(500).json({ message: err.message || 'Failed to schedule pickup' });
+  }
+});
+
+router.post('/shipping/batch-shipments', async (req, res) => {
+  try {
+    const { orderIds } = req.body;
+    if (!Array.isArray(orderIds) || orderIds.length === 0) return res.json({ shipments: {} });
+    const shipments = await Shipment.find({ orderId: { $in: orderIds }, sellerId: req.user._id }).lean();
+    const map = {};
+    for (const s of shipments) map[s.orderId.toString()] = s;
+    res.json({ shipments: map });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
