@@ -698,7 +698,26 @@ router.put('/orders/:id/status', async (req, res) => {
     if (!allowed.includes(status)) return res.status(400).json({ message: `Cannot change from ${order.status} to ${status}` });
 
     order.status = status;
-    if (status === 'cancelled') order.cancelledAt = new Date();
+    if (status === 'cancelled') {
+      order.cancelledAt = new Date();
+      const shipment = await Shipment.findOne({ orderId: order._id, sellerId: req.user._id });
+      if (shipment && shipment.shiprocketOrderId) {
+        const pickedUp = ['picked_up', 'in_transit', 'out_for_delivery', 'delivered'];
+        if (pickedUp.includes(shipment.status)) {
+          return res.status(400).json({
+            message: `Cannot cancel — package already ${shipment.status.replace(/_/g, ' ')} by courier`
+          });
+        }
+        try {
+          await shiprocket.cancelShiprocketOrder({ shiprocketOrderId: shipment.shiprocketOrderId });
+        } catch (e) {
+          logger.warn(`[Shipping] Shiprocket cancel failed for order ${order.orderNumber}: ${e.message}`);
+        }
+        shipment.status = 'cancelled';
+        shipment.statusHistory.push({ status: 'cancelled', description: 'Cancelled by seller' });
+        await shipment.save();
+      }
+    }
     if (status === 'delivered') {
       order.deliveredAt = new Date();
       // Send delivered email
