@@ -1208,11 +1208,27 @@ router.post('/shipping/:orderId/create', async (req, res) => {
 
     // Extract IDs from multiple possible response formats
     const srOrderId = (result.order_id || result.payload?.order_id || '').toString();
-    const srShipmentId = (result.shipment_id || result.payload?.shipment_id || '').toString();
+    let srShipmentId = (result.shipment_id || result.payload?.shipment_id || '').toString();
 
     if (!srOrderId) {
       logger.error('[Shiprocket] No order_id in response:', result);
       return res.status(500).json({ message: 'Shiprocket did not return an order ID', shiprocketResponse: result });
+    }
+
+    // Shiprocket sometimes omits shipment_id from create response — fetch it
+    if (!srShipmentId) {
+      logger.warn('[Shiprocket] No shipment_id in create response, fetching order details...');
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const details = await shiprocket.getShiprocketOrderDetails(srOrderId);
+        const shipments = details?.data?.shipments || details?.shipments || [];
+        if (shipments.length > 0) {
+          srShipmentId = shipments[0].id?.toString() || '';
+          logger.info(`[Shiprocket] Fetched shipment_id=${srShipmentId} from order details`);
+        }
+      } catch (fetchErr) {
+        logger.warn('[Shiprocket] Could not fetch order details:', fetchErr.message);
+      }
     }
 
     const shipment = existing || new Shipment({ orderId: order._id, sellerId: req.user._id });
@@ -1225,13 +1241,13 @@ router.post('/shipping/:orderId/create', async (req, res) => {
     await shipment.save();
 
     if (!srShipmentId) {
-      logger.warn('[Shiprocket] Shipment created but no shipment_id returned. Courier assignment will need shipment_id.');
+      logger.warn('[Shiprocket] shipment_id still missing after retry — courier assignment will fail until resolved.');
     }
 
     order.status = 'processing';
     await order.save();
 
-    res.json({ message: 'Shipment created', shipment, warning: !srShipmentId ? 'No shipment_id returned — courier assignment may fail until Shiprocket processes this order' : undefined });
+    res.json({ message: 'Shipment created', shipment, warning: !srShipmentId ? 'Shipment created but courier assignment may need a retry' : undefined });
   } catch (err) {
     logger.error('Create shipment error:', err?.response?.data || err.message);
     res.status(500).json({ message: 'Failed to create shipment', error: err?.response?.data?.message || err.message });
@@ -1243,6 +1259,21 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
     const { courierId, courierRate } = req.body;
     const shipment = await Shipment.findOne({ orderId: req.params.orderId, sellerId: req.user._id });
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
+
+    if (!shipment.shiprocketShipmentId && shipment.shiprocketOrderId) {
+      logger.info(`[Shipping] shiprocketShipmentId missing, fetching from order ${shipment.shiprocketOrderId}...`);
+      try {
+        const details = await shiprocket.getShiprocketOrderDetails(shipment.shiprocketOrderId);
+        const shipments = details?.data?.shipments || details?.shipments || [];
+        if (shipments.length > 0 && shipments[0].id) {
+          shipment.shiprocketShipmentId = shipments[0].id.toString();
+          await shipment.save();
+          logger.info(`[Shipping] Self-healed shiprocketShipmentId=${shipment.shiprocketShipmentId}`);
+        }
+      } catch (e) {
+        logger.warn('[Shipping] Could not fetch order details for self-heal:', e.message);
+      }
+    }
 
     if (!shipment.shiprocketShipmentId) {
       return res.status(400).json({ message: 'Shipment ID missing — please recreate the shipment' });
