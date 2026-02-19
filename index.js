@@ -30,14 +30,15 @@ app.use(helmet({
 
 // Compression
 app.use(compression());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// Request logging
+// Request logging (skip health checks, demote fast requests to debug)
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
+    if (req.originalUrl === '/api/seller/health') return;
     const duration = Date.now() - start;
-    const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : duration > 500 ? 'info' : 'debug';
     logger[level](`${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`, {
       method: req.method, url: req.originalUrl, status: res.statusCode, duration
     });
