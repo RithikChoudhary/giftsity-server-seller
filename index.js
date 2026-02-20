@@ -48,6 +48,7 @@ app.use((req, res, next) => {
 
 // Routes - all mounted under /api/seller
 app.use('/api/seller', require('./routes/seller'));
+app.use('/api/seller/weight-disputes', require('../server/routes/weightDisputes'));
 
 // Health check
 app.get('/api/seller/health', (req, res) => res.json({ status: 'ok', service: 'giftsity-seller', port: PORT }));
