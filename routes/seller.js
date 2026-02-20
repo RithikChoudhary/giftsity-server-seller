@@ -1145,8 +1145,8 @@ router.post('/shipping/serviceability', async (req, res) => {
       rating: c.rating
     }));
 
-    // Cap courier selection: when customer paid for shipping, only show couriers within budget
-    const shippingBudget = order.shippingPaidBy === 'customer' ? (order.actualShippingCost || order.shippingCost || 0) : null;
+    // Cap courier selection: only show couriers within what the customer actually paid
+    const shippingBudget = order.shippingPaidBy === 'customer' ? (order.shippingCost || 0) : null;
     if (shippingBudget && shippingBudget > 0) {
       couriers = couriers.filter(c => c.rate <= shippingBudget);
       logger.info(`[Shipping] Filtered to ${couriers.length} couriers within budget Rs. ${shippingBudget}`);
