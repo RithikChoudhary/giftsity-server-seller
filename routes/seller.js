@@ -1334,6 +1334,11 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
 
     const result = await shiprocket.assignCourier({ shipmentId: shipment.shiprocketShipmentId, courierId });
 
+    if (result.awb_assign_status === 0 || (!result.response?.data?.awb_code && !result.awb_code)) {
+      const errorMsg = result.response?.data?.awb_assign_error || result.message || 'Courier assignment failed on Shiprocket';
+      return res.status(400).json({ message: errorMsg });
+    }
+
     shipment.awbCode = result.response?.data?.awb_code || result.awb_code || '';
     shipment.courierName = result.response?.data?.courier_name || result.courier_name || '';
     shipment.courierId = courierId;
