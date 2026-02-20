@@ -768,6 +768,14 @@ router.put('/orders/:id/status', async (req, res) => {
       } catch (e) { logger.error('Corporate status email error:', e.message); }
     }
 
+    // Send cancellation email to customer
+    if (status === 'cancelled' && order.customerEmail) {
+      try {
+        const { sendCancellationEmail } = require('../../server/utils/email');
+        await sendCancellationEmail(order.customerEmail, order);
+      } catch (e) { logger.error('Cancellation email error:', e.message); }
+    }
+
     // Notify customer about status change
     const statusNotifTypes = { delivered: 'order_delivered', shipped: 'order_shipped', cancelled: 'order_cancelled' };
     if (statusNotifTypes[status] && order.customerId) {
@@ -1117,7 +1125,15 @@ router.post('/shipping/serviceability', async (req, res) => {
     const deliveryPincode = order.shippingAddress?.pincode;
     if (!deliveryPincode) return res.status(400).json({ message: 'Order has no delivery pincode' });
 
-    const result = await shiprocket.checkServiceability({ pickupPincode, deliveryPincode, weight: 500, cod: 0 });
+    const productIds = order.items.map(i => i.productId);
+    const products = await Product.find({ _id: { $in: productIds } }).select('weight').lean();
+    let totalWeight = 0;
+    for (const item of order.items) {
+      const prod = products.find(p => p._id.toString() === item.productId.toString());
+      totalWeight += ((prod?.weight || 500) * (item.quantity || 1));
+    }
+
+    const result = await shiprocket.checkServiceability({ pickupPincode, deliveryPincode, weight: totalWeight, cod: 0 });
 
     const companies = result?.data?.available_courier_companies || result?.available_courier_companies || [];
     let couriers = companies.map(c => ({
@@ -1182,11 +1198,18 @@ router.post('/shipping/:orderId/create', async (req, res) => {
       }
     }
 
-    // Validate and clamp weight/dimensions to reasonable bounds
-    const weight = Math.max(50, Math.min(50000, Number(req.body.weight) || 500));   // 50g to 50kg
-    const length = Math.max(1, Math.min(200, Number(req.body.length) || 10));       // 1cm to 200cm
-    const width = Math.max(1, Math.min(200, Number(req.body.width) || 10));         // 1cm to 200cm
-    const height = Math.max(1, Math.min(200, Number(req.body.height) || 10));       // 1cm to 200cm
+    // Calculate actual weight from order items instead of relying on request body
+    const productIds = order.items.map(i => i.productId);
+    const orderProducts = await Product.find({ _id: { $in: productIds } }).select('weight').lean();
+    let calculatedWeight = 0;
+    for (const item of order.items) {
+      const prod = orderProducts.find(p => p._id.toString() === item.productId.toString());
+      calculatedWeight += ((prod?.weight || 500) * (item.quantity || 1));
+    }
+    const weight = Math.max(50, Math.min(50000, calculatedWeight));
+    const length = Math.max(1, Math.min(200, Number(req.body.length) || 10));
+    const width = Math.max(1, Math.min(200, Number(req.body.width) || 10));
+    const height = Math.max(1, Math.min(200, Number(req.body.height) || 10));
 
     // Use seller's registered Shiprocket pickup location, fall back to fetching from API
     let pickupLocationName = seller.sellerProfile?.shiprocketPickupLocation || '';
@@ -1321,16 +1344,61 @@ router.post('/shipping/:orderId/assign-courier', async (req, res) => {
     await shipment.save();
 
     // Update order's actualShippingCost with real courier rate (used for payout deduction)
-    if (courierRate && courierRate > 0) {
-      const order = await Order.findById(req.params.orderId);
-      if (order && order.shippingPaidBy === 'seller') {
-        order.actualShippingCost = Math.round(courierRate);
-        await order.save();
-        logger.info(`[Shipping] Updated actualShippingCost to Rs.${Math.round(courierRate)} for order ${order.orderNumber}`);
+    const order = await Order.findById(req.params.orderId);
+    if (courierRate && courierRate > 0 && order && order.shippingPaidBy === 'seller') {
+      order.actualShippingCost = Math.round(courierRate);
+      await order.save();
+      logger.info(`[Shipping] Updated actualShippingCost to Rs.${Math.round(courierRate)} for order ${order.orderNumber}`);
+    }
+
+    // Auto-schedule pickup so the seller doesn't need a separate step
+    let pickupScheduled = false;
+    try {
+      await shiprocket.schedulePickup({ shipmentId: shipment.shiprocketShipmentId });
+      pickupScheduled = true;
+      logger.info(`[Pickup] Auto-scheduled for shipment ${shipment.shiprocketShipmentId}`);
+    } catch (pickupErr) {
+      const errMsg = pickupErr?.response?.data?.message || pickupErr?.response?.data || pickupErr.message || '';
+      const errStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
+      if (errStr.toLowerCase().includes('already') || errStr.toLowerCase().includes('scheduled')) {
+        pickupScheduled = true;
+        logger.info(`[Pickup] Already scheduled for shipment ${shipment.shiprocketShipmentId}`);
+      } else {
+        logger.warn(`[Pickup] Auto-schedule failed: ${errStr} — seller can retry manually`);
       }
     }
 
-    res.json({ message: 'Courier assigned', shipment });
+    if (pickupScheduled) {
+      shipment.status = 'pickup_scheduled';
+      shipment.pickupScheduledAt = new Date();
+      shipment.statusHistory.push({ status: 'pickup_scheduled', description: 'Pickup auto-scheduled' });
+      await shipment.save();
+
+      if (order) {
+        const { isValidTransition } = require('../../server/utils/orderStatus');
+        if (isValidTransition(order.status, 'shipped')) {
+          order.status = 'shipped';
+          order.trackingInfo = { courierName: shipment.courierName, trackingNumber: shipment.awbCode, shippedAt: new Date() };
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'shipped', timestamp: new Date(), changedBy: req.user._id, changedByRole: 'seller', note: `Shipped via ${shipment.courierName}` });
+          await order.save();
+
+          createNotification({
+            userId: order.customerId.toString(), userRole: 'customer',
+            type: 'order_shipped', title: `Order #${order.orderNumber} shipped`,
+            message: `Your order has been shipped via ${shipment.courierName}`,
+            link: `/orders/${order._id}`, metadata: { orderId: order._id.toString() }
+          });
+
+          try {
+            const { sendShippedEmail } = require('../../server/utils/email');
+            if (order.customerEmail) await sendShippedEmail(order.customerEmail, order);
+          } catch (emailErr) { logger.error('[Email] Shipped email error:', emailErr.message); }
+        }
+      }
+    }
+
+    res.json({ message: pickupScheduled ? 'Courier assigned & pickup scheduled' : 'Courier assigned (schedule pickup manually)', shipment, pickupScheduled });
   } catch (err) {
     logger.error('Assign courier error:', err?.response?.data || err.message);
     res.status(500).json({ message: err?.response?.data?.message || 'Failed to assign courier', error: err?.response?.data });
