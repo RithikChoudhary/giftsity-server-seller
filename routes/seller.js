@@ -876,7 +876,26 @@ router.put('/settings', sanitizeBody, async (req, res) => {
     const { businessName, businessAddress, pickupAddress, bankDetails, phone, bio, businessType, gstNumber, instagramUsername } = req.body;
     const user = req.user;
 
-    if (businessName) user.sellerProfile.businessName = businessName;
+    if (businessName && businessName.trim() !== user.sellerProfile.businessName) {
+      const escapedName = businessName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const existingBusinessName = await Seller.findOne({
+        'sellerProfile.businessName': { $regex: new RegExp(`^${escapedName}$`, 'i') },
+        _id: { $ne: user._id }
+      });
+      if (existingBusinessName) {
+        return res.status(400).json({ message: 'Business name already taken. Please choose a different one.' });
+      }
+      const oldSlug = user.sellerProfile.businessSlug;
+      if (oldSlug) {
+        if (!user.sellerProfile.oldSlugs) user.sellerProfile.oldSlugs = [];
+        if (!user.sellerProfile.oldSlugs.includes(oldSlug)) {
+          user.sellerProfile.oldSlugs.push(oldSlug);
+        }
+      }
+      const { generateUniqueSlug } = require('../../server/utils/slugify');
+      user.sellerProfile.businessName = businessName.trim();
+      user.sellerProfile.businessSlug = await generateUniqueSlug(businessName, Seller, user._id);
+    }
     if (businessAddress) user.sellerProfile.businessAddress = businessAddress;
     if (pickupAddress) user.sellerProfile.pickupAddress = pickupAddress;
     if (bankDetails) {
